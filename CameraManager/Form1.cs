@@ -639,10 +639,8 @@ namespace CameraManager
         {
             try
             {
-                for (int i = 0; i < NumCameras; i++)
-                {
-                    _cameraDetections.Add(new List<Detection>());
-                }
+                // Do not assume camera count at startup; cameras load later.
+                EnsureCameraDetectionsSize(Math.Max(1, NumCameras));
 
                 _detectionTimer.Interval = DETECTION_TIMER_INTERVAL_MS;
                 _detectionTimer.Tick += DetectionTimer_Tick;
@@ -660,6 +658,25 @@ namespace CameraManager
             }
         }
 
+        private void EnsureCameraDetectionsSize(int target)
+        {
+            try
+            {
+                if (target <= 0) target = 1;
+                lock (_cameraDetections)
+                {
+                    while (_cameraDetections.Count < target)
+                    {
+                        _cameraDetections.Add(new List<Detection>());
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                FileLogger.LogException(ex, "EnsureCameraDetectionsSize");
+            }
+        }
+
         private void DetectionCleanupTimer_Tick(object sender, EventArgs e)
         {
             try
@@ -670,6 +687,7 @@ namespace CameraManager
 
                 lock (_cameraDetections)
                 {
+                    EnsureCameraDetectionsSize(Math.Max(NumCameras, _pictureboxes.Count));
                     for (int cameraIndex = 0; cameraIndex < _cameraDetections.Count; cameraIndex++)
                     {
                         var detections = _cameraDetections[cameraIndex];
@@ -771,8 +789,25 @@ namespace CameraManager
                 }
 
                 var result = await response.Content.ReadAsStringAsync();
-                var detections = JsonConvert.DeserializeObject<List<Detection>>(result) ?? new List<Detection>();
+                var detectionsRaw = JsonConvert.DeserializeObject<List<Detection>>(result) ?? new List<Detection>();
 
+                // Debug raw
+                if (detectionsRaw.Count > 0)
+                {
+                    var d = detectionsRaw[0];
+                    FileLogger.Log($"Detect RAW cam {cameraIndex + 1}: cnt={detectionsRaw.Count} first=({d.label},{d.score:F2}) x1={d.x1:F3},y1={d.y1:F3},x2={d.x2:F3},y2={d.y2:F3}");
+                }
+
+                // Normalize detections to original frame coordinates [0..1]
+                var detections = NormalizeDetectionsToOriginalFrame(detectionsRaw, frame.Width, frame.Height, DETECT_INPUT_SIZE);
+
+                if (detections.Count > 0)
+                {
+                    var d = detections[0];
+                    FileLogger.Log($"Detect NORM cam {cameraIndex + 1}: cnt={detections.Count} first=({d.label},{d.score:F2}) x1={d.x1:F3},y1={d.y1:F3},x2={d.x2:F3},y2={d.y2:F3}");
+                }
+
+                EnsureCameraDetectionsSize(cameraIndex + 1);
                 lock (_cameraDetections)
                 {
                     if (cameraIndex < _cameraDetections.Count)
@@ -804,6 +839,71 @@ namespace CameraManager
             }
         }
 
+        // Convert detections (either normalized or pixel wrt square input) to normalized [0..1] on original frame
+        private List<Detection> NormalizeDetectionsToOriginalFrame(List<Detection> input, int frameW, int frameH, int squareSize)
+        {
+            try
+            {
+                if (input == null || input.Count == 0) return new List<Detection>();
+                if (frameW <= 0 || frameH <= 0 || squareSize <= 0) return new List<Detection>(input);
+
+                double scale = Math.Min((double)squareSize / frameW, (double)squareSize / frameH);
+                double newW = frameW * scale;
+                double newH = frameH * scale;
+                double offX = (squareSize - newW) / 2.0;
+                double offY = (squareSize - newH) / 2.0;
+
+                var list = new List<Detection>(input.Count);
+                foreach (var d in input)
+                {
+                    if (d == null) continue;
+
+                    bool squareNormalized = d.x2 <= 1.5 && d.y2 <= 1.5 && d.x1 >= 0 && d.y1 >= 0;
+
+                    // Convert to square pixel coordinates first
+                    double sx1 = squareNormalized ? d.x1 * squareSize : d.x1;
+                    double sy1 = squareNormalized ? d.y1 * squareSize : d.y1;
+                    double sx2 = squareNormalized ? d.x2 * squareSize : d.x2;
+                    double sy2 = squareNormalized ? d.y2 * squareSize : d.y2;
+
+                    // Map back to original frame pixel coordinates (undo letterbox + scale)
+                    double ox1 = (sx1 - offX) / scale;
+                    double oy1 = (sy1 - offY) / scale;
+                    double ox2 = (sx2 - offX) / scale;
+                    double oy2 = (sy2 - offY) / scale;
+
+                    // Clamp
+                    ox1 = Math.Max(0, Math.Min(frameW, ox1));
+                    oy1 = Math.Max(0, Math.Min(frameH, oy1));
+                    ox2 = Math.Max(0, Math.Min(frameW, ox2));
+                    oy2 = Math.Max(0, Math.Min(frameH, oy2));
+
+                    // Normalize to [0..1]
+                    double nx1 = frameW > 0 ? ox1 / frameW : 0;
+                    double ny1 = frameH > 0 ? oy1 / frameH : 0;
+                    double nx2 = frameW > 0 ? ox2 / frameW : 0;
+                    double ny2 = frameH > 0 ? oy2 / frameH : 0;
+
+                    list.Add(new Detection
+                    {
+                        label = d.label,
+                        score = d.score,
+                        x1 = nx1,
+                        y1 = ny1,
+                        x2 = nx2,
+                        y2 = ny2,
+                        timestamp = DateTime.Now
+                    });
+                }
+                return list;
+            }
+            catch (Exception ex)
+            {
+                FileLogger.LogException(ex, "NormalizeDetectionsToOriginalFrame");
+                return new List<Detection>(input);
+            }
+        }
+
         private void TriggerPaintEvent(int cameraIndex, int detectionCount)
         {
             try
@@ -817,8 +917,15 @@ namespace CameraManager
                 if (cameraIndex < _pictureboxes.Count && !_pictureboxes[cameraIndex].IsDisposed)
                 {
                     var pictureBox = _pictureboxes[cameraIndex];
-                    // Invalidate only; avoid forcing immediate Update to reduce UI load
-                    pictureBox.Invalidate();
+                    // Force refresh when we have detections to ensure overlay appears promptly
+                    if (detectionCount > 0)
+                    {
+                        pictureBox.Refresh();
+                    }
+                    else
+                    {
+                        pictureBox.Invalidate();
+                    }
                 }
             }
             catch (Exception ex)
@@ -833,18 +940,45 @@ namespace CameraManager
             {
                 if (graphics == null || detections == null) return;
 
+                // Draw quick debug info: number of detections
+                try
+                {
+                    using var dbgFont = new Font("Arial", 9, FontStyle.Bold);
+                    using var dbgBrush = new SolidBrush(Color.Red);
+                    graphics.DrawString($"{detections.Count} dets", dbgFont, dbgBrush, 8, 8);
+                }
+                catch { }
+
+                int idx = 0;
                 foreach (var detection in detections)
                 {
                     if (detection.score < 0.3) continue;
 
-                    int x1 = (int)(detection.x1 * imageWidth);
-                    int y1 = (int)(detection.y1 * imageHeight);
-                    int x2 = (int)(detection.x2 * imageWidth);
-                    int y2 = (int)(detection.y2 * imageHeight);
+                    // Support both normalized [0,1] and absolute coordinates
+                    // If any coordinate > 1, assume absolute pixels already
+                    bool isNormalized = detection.x2 <= 1.5 && detection.y2 <= 1.5 && detection.x1 >= 0 && detection.y1 >= 0;
+
+                    int x1 = (int)((isNormalized ? detection.x1 : detection.x1 / Math.Max(1, imageWidth)) * imageWidth);
+                    int y1 = (int)((isNormalized ? detection.y1 : detection.y1 / Math.Max(1, imageHeight)) * imageHeight);
+                    int x2 = (int)((isNormalized ? detection.x2 : detection.x2 / Math.Max(1, imageWidth)) * imageWidth);
+                    int y2 = (int)((isNormalized ? detection.y2 : detection.y2 / Math.Max(1, imageHeight)) * imageHeight);
+
+                    // Order and clamp to bounds
+                    int left = Math.Max(0, Math.Min(imageWidth - 1, Math.Min(x1, x2)));
+                    int top = Math.Max(0, Math.Min(imageHeight - 1, Math.Min(y1, y2)));
+                    int right = Math.Max(0, Math.Min(imageWidth - 1, Math.Max(x1, x2)));
+                    int bottom = Math.Max(0, Math.Min(imageHeight - 1, Math.Max(y1, y2)));
+                    int w = Math.Max(1, right - left);
+                    int h = Math.Max(1, bottom - top);
+
+                    if (idx == 0)
+                    {
+                        FileLogger.Log($"Draw cam overlay: img=({imageWidth}x{imageHeight}) rect=({left},{top},{w},{h})");
+                    }
 
                     using (var pen = new Pen(Color.Lime, 2))
                     {
-                        Rectangle rect = new Rectangle(x1, y1, x2 - x1, y2 - y1);
+                        Rectangle rect = new Rectangle(left, top, w, h);
                         graphics.DrawRectangle(pen, rect);
                     }
 
@@ -853,9 +987,10 @@ namespace CameraManager
                     {
                         using (var textBrush = new SolidBrush(Color.White))
                         {
-                            graphics.DrawString(labelText, font, textBrush, new PointF(x1 + 3, y1 - 20));
+                            graphics.DrawString(labelText, font, textBrush, new PointF(left + 3, Math.Max(0, top - 18)));
                         }
                     }
+                    idx++;
                 }
             }
             catch (Exception ex)
@@ -1069,11 +1204,17 @@ namespace CameraManager
                     }
                 };
 
-                if (_pictureboxes.Count > 0 && !_pictureboxes[0].IsDisposed)
+                lock (_cameraDetections)
                 {
-                    var pictureBox = _pictureboxes[0];
-                    pictureBox.Invalidate();
+                    if (_cameraDetections.Count == 0)
+                    {
+                        _cameraDetections.Add(new List<Detection>());
+                    }
+                    _cameraDetections[0].Clear();
+                    _cameraDetections[0].AddRange(testDetections);
                 }
+
+                TriggerPaintEvent(0, testDetections.Count);
             }
             catch (Exception ex)
             {
@@ -1305,6 +1446,9 @@ namespace CameraManager
                     }
                 }
 
+                // Ensure detection slots match number of picture boxes
+                EnsureCameraDetectionsSize(_pictureboxes.Count);
+
                 FileLogger.Log($"? Created dynamic layout with {_pictureboxes.Count} camera PictureBoxes");
             }
             catch (Exception ex)
@@ -1317,15 +1461,13 @@ namespace CameraManager
         {
             try
             {
+                EnsureCameraDetectionsSize(cameraIndex + 1);
                 if (_isShuttingDown || cameraIndex >= _cameraDetections.Count) return;
 
                 var pictureBox = sender as PictureBox;
-                if (pictureBox?.Image == null) return;
+                if (pictureBox == null) return;
 
-                if (pictureBox.Image != null)
-                {
-                    e.Graphics.DrawImage(pictureBox.Image, new Rectangle(0, 0, pictureBox.Width, pictureBox.Height));
-                }
+                // PictureBox will draw its Image by itself. We only draw overlay.
 
                 List<Detection> detections = null;
                 lock (_cameraDetections)
