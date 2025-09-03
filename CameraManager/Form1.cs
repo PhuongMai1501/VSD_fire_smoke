@@ -891,11 +891,63 @@ namespace CameraManager
 
                     annotated.Save(filePath, ImageFormat.Jpeg);
                     FileLogger.Log($"Saved detection image (cam {cameraIndex + 1}): {filePath}");
+
+                    // Also log to database for tracking
+                    try
+                    {
+                        var labels = detections
+                            .Where(d => d != null && !string.IsNullOrWhiteSpace(d.label))
+                            .Select(d => d.label)
+                            .ToList();
+                        string eventText = labels.Count > 0
+                            ? $"DETECTION: {string.Join(",", labels)}"
+                            : "DETECTION";
+                        AddCameraLogData(cameraIndex + 1, DateTime.Now, eventText, filePath);
+
+                        // Tự động refresh bảng log sau khi có detection mới
+                        try { UpdateCameraLogInvoke(this); } catch { }
+                    }
+                    catch (Exception exAddLog)
+                    {
+                        FileLogger.LogException(exAddLog, "SaveDetectionImage -> AddCameraLogData");
+                    }
                 }
             }
             catch (Exception ex)
             {
                 FileLogger.LogException(ex, "SaveDetectionImage");
+            }
+        }
+
+        private void AddCameraLogData(int cameraNumber, DateTime time, string eventText, string imagePath)
+        {
+            try
+            {
+                string connStr = null;
+                try { connStr = ClassSystemConfig.Ins?.m_ClsCommon?.connectionString; } catch { connStr = null; }
+                if (string.IsNullOrWhiteSpace(connStr))
+                {
+                    FileLogger.Log("AddCameraLogData: Missing connection string");
+                    return;
+                }
+
+                using (var conn = new MySql.Data.MySqlClient.MySqlConnection(connStr))
+                {
+                    conn.Open();
+                    string sql = "INSERT INTO camera_log (`Camera`, `Time`, `Event`, `image_Path`) VALUES (@cam, @time, @event, @path)";
+                    using (var cmd = new MySql.Data.MySqlClient.MySqlCommand(sql, conn))
+                    {
+                        cmd.Parameters.AddWithValue("@cam", cameraNumber);
+                        cmd.Parameters.AddWithValue("@time", time);
+                        cmd.Parameters.AddWithValue("@event", eventText ?? "DETECTION");
+                        cmd.Parameters.AddWithValue("@path", imagePath ?? string.Empty);
+                        cmd.ExecuteNonQuery();
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                FileLogger.LogException(ex, "AddCameraLogData");
             }
         }
 
