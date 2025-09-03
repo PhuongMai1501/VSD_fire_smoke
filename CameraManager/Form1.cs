@@ -879,15 +879,22 @@ namespace CameraManager
                     try { baseRoot = ClassSystemConfig.Ins?.m_ClsCommon?.m_CommonPath; } catch { baseRoot = null; }
                     if (string.IsNullOrWhiteSpace(baseRoot))
                     {
-                        baseRoot = Path.Combine(Environment.CurrentDirectory, "Images");
+                        baseRoot = Environment.CurrentDirectory;
                     }
+                    string imagesRoot = Path.Combine(baseRoot, "Images");
 
                     var now = DateTime.Now;
-                    string saveDir = Path.Combine(baseRoot, now.ToString("yyyy"), now.ToString("MM"), now.ToString("dd"));
+                    string saveDir = Path.Combine(
+                        imagesRoot,
+                        now.ToString("yyyy"),        // 2025
+                        now.ToString("MM_yyyy"),     // 09_2025
+                        now.ToString("dd_MM_yyyy"),  // 03_09_2025
+                        "graphic");
                     Directory.CreateDirectory(saveDir);
 
                     int nextIdx = GetNextImageIndex(saveDir);
-                    string filePath = Path.Combine(saveDir, $"image_{nextIdx}.jpg");
+                    string fileName = $"cam_{cameraIndex + 1}_{now:HH_mm_ss_fff}_{nextIdx}.jpg";
+                    string filePath = Path.Combine(saveDir, fileName);
 
                     annotated.Save(filePath, ImageFormat.Jpeg);
                     FileLogger.Log($"Saved detection image (cam {cameraIndex + 1}): {filePath}");
@@ -957,17 +964,33 @@ namespace CameraManager
             {
                 if (!Directory.Exists(directory)) return 1;
                 int maxIdx = 0;
-                foreach (var file in Directory.GetFiles(directory, "image_*.jpg"))
+
+                foreach (var file in Directory.GetFiles(directory, "*.jpg"))
                 {
                     var name = Path.GetFileNameWithoutExtension(file);
+
+                    // Pattern 1: image_<idx>.jpg
                     if (name.StartsWith("image_", StringComparison.OrdinalIgnoreCase))
                     {
-                        if (int.TryParse(name.Substring(6), out int idx))
+                        if (int.TryParse(name.Substring(6), out int idx1))
+                            if (idx1 > maxIdx) maxIdx = idx1;
+                        continue;
+                    }
+
+                    // Pattern 2: cam_<camIdx>_<HH_mm_ss_fff>_<idx>.jpg
+                    if (name.StartsWith("cam_", StringComparison.OrdinalIgnoreCase))
+                    {
+                        var parts = name.Split('_');
+                        if (parts.Length >= 5)
                         {
-                            if (idx > maxIdx) maxIdx = idx;
+                            // last part should be index
+                            if (int.TryParse(parts[parts.Length - 1], out int idx2))
+                                if (idx2 > maxIdx) maxIdx = idx2;
                         }
+                        continue;
                     }
                 }
+
                 return maxIdx + 1;
             }
             catch
