@@ -118,6 +118,9 @@ namespace CameraManager
 
         public SystemStatus _Status = new SystemStatus();
         public ClassResultCounter ClsCount = new ClassResultCounter();
+
+        // Detection config
+        public int DetectionInputSize { get; set; } = 1280; // default 1280x1280 for API input
         #endregion
 
         #region Control Invoke

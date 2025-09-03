@@ -83,7 +83,8 @@ namespace CameraManager
         private readonly Dictionary<int, DateTime> _lastDetectAt = new Dictionary<int, DateTime>();
         private const int DETECT_MIN_INTERVAL_MS = 100; // per-camera min interval (≈10 FPS); adjust down to 50 for ~20 FPS
         private const int DETECTION_TIMER_INTERVAL_MS = 150; // drive scheduling loop cadence
-        private const int MAX_DETECT_WIDTH = 1280; // resize width before sending to AI
+        // Detection input config: use square input size from global config
+        private int DETECT_INPUT_SIZE => Math.Max(1, ClassSystemConfig.Ins?.m_ClsCommon?.DetectionInputSize ?? 1280);
         private const long JPEG_QUALITY = 75L; // JPEG quality for request payload
 
         // MySQL Connection
@@ -753,7 +754,7 @@ namespace CameraManager
                 }
 
                 // Resize frame to reduce payload
-                using var resized = ResizeToMaxWidth(frame, MAX_DETECT_WIDTH);
+                using var resized = ResizeToSquare(frame, DETECT_INPUT_SIZE);
 
                 // Encode JPEG with quality and to base64
                 var jpegBytes = EncodeJpeg(resized, JPEG_QUALITY);
@@ -816,8 +817,8 @@ namespace CameraManager
                 if (cameraIndex < _pictureboxes.Count && !_pictureboxes[cameraIndex].IsDisposed)
                 {
                     var pictureBox = _pictureboxes[cameraIndex];
+                    // Invalidate only; avoid forcing immediate Update to reduce UI load
                     pictureBox.Invalidate();
-                    pictureBox.Update();
                 }
             }
             catch (Exception ex)
@@ -1757,11 +1758,108 @@ namespace CameraManager
 
                 ForceKillAllCameraWorkers();
 
+                // Ensure all resources are disposed and cleared
+                CleanupResources();
+
                 FileLogger.Log("? Emergency shutdown completed");
             }
             catch (Exception ex)
             {
                 FileLogger.LogException(ex, "EmergencyShutdown");
+            }
+        }
+
+        private static Bitmap ResizeToSquare(Bitmap src, int size)
+        {
+            if (src == null) return null;
+            if (size <= 0) return (Bitmap)src.Clone();
+
+            // Maintain aspect ratio, letterbox into square canvas
+            double scale = Math.Min((double)size / src.Width, (double)size / src.Height);
+            int newW = Math.Max(1, (int)Math.Round(src.Width * scale));
+            int newH = Math.Max(1, (int)Math.Round(src.Height * scale));
+            int offsetX = (size - newW) / 2;
+            int offsetY = (size - newH) / 2;
+
+            var dst = new Bitmap(size, size);
+            using (var g = Graphics.FromImage(dst))
+            {
+                g.Clear(Color.Black);
+                g.CompositingQuality = System.Drawing.Drawing2D.CompositingQuality.HighQuality;
+                g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.HighQuality;
+                g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
+                g.DrawImage(src, new Rectangle(offsetX, offsetY, newW, newH));
+            }
+            return dst;
+        }
+
+        private void CleanupResources()
+        {
+            try
+            {
+                // Dispose supervisors
+                if (_supervisors != null && _supervisors.Count > 0)
+                {
+                    foreach (var sup in _supervisors)
+                    {
+                        try { sup?.Dispose(); } catch { }
+                    }
+                    _supervisors.Clear();
+                }
+
+                // Dispose MMFs
+                if (_mmfs != null && _mmfs.Count > 0)
+                {
+                    foreach (var mmf in _mmfs)
+                    {
+                        try { mmf?.Dispose(); } catch { }
+                    }
+                    _mmfs.Clear();
+                }
+
+                // Dispose Mutexes
+                if (_mutexes != null && _mutexes.Count > 0)
+                {
+                    foreach (var m in _mutexes)
+                    {
+                        try { m?.Dispose(); } catch { }
+                    }
+                    _mutexes.Clear();
+                }
+
+                // Dispose latest frames
+                lock (_frameStoreLock)
+                {
+                    foreach (var kv in _latestFrames)
+                    {
+                        try { kv.Value?.Dispose(); } catch { }
+                    }
+                    _latestFrames.Clear();
+                }
+
+                // Clear picture boxes and dispose old images
+                foreach (var pictureBox in _pictureboxes)
+                {
+                    try
+                    {
+                        if (pictureBox != null && !pictureBox.IsDisposed)
+                        {
+                            var old = pictureBox.Image;
+                            pictureBox.Image = null;
+                            try { old?.Dispose(); } catch { }
+
+                            if (pictureBox.Controls.Count > 0)
+                            {
+                                pictureBox.Controls[0].Visible = true;
+                            }
+                        }
+                    }
+                    catch { }
+                }
+            }
+            catch (Exception ex)
+            {
+                FileLogger.LogException(ex, "CleanupResources");
             }
         }
 
