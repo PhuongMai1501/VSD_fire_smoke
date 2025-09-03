@@ -1,0 +1,2029 @@
+﻿using LittleForker;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.Data;
+using System.Drawing;
+using System.Drawing.Imaging;
+using System.IO.MemoryMappedFiles;
+using System.Linq;
+using System.Net.Http;
+using System.Net;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Threading.Tasks;
+using System.Windows.Forms;
+using Newtonsoft.Json;
+using MySql.Data.MySqlClient;
+using System.Threading;
+using System.IO;
+
+namespace CameraManager
+{
+    public partial class Form1 : Form
+    {
+        #region Camera System Variables
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr LoadLibrary(string lpFileName);
+
+        // Dynamic camera count based on database
+        private int NumCameras => Math.Max(1, ClassSystemConfig.Ins.m_ClsCommon.m_ListRtspCam?.Count ?? 12);
+
+        private readonly List<ProcessSupervisor> _supervisors = new List<ProcessSupervisor>();
+        private readonly List<MemoryMappedFile> _mmfs = new List<MemoryMappedFile>();
+        private readonly List<Mutex> _mutexes = new List<Mutex>();
+
+        private readonly List<PictureBox> _pictureboxes = new List<PictureBox>();
+        private volatile bool _isShuttingDown = false;
+
+        private const int MaxFrameWidth = 3840;
+        private const int MaxFrameHeight = 2160;
+        private const long MaxFrameSize = (long)MaxFrameWidth * MaxFrameHeight * 3;
+
+        // FPS Configuration
+        private const int TARGET_FPS = 50;
+        private const int TIMER_INTERVAL = 1000 / TARGET_FPS;
+
+        // Dynamic Layout Variables
+        private TableLayoutPanel tableLayoutPanelCamera;
+        private TableLayoutPanel[] tableLayoutPanelDevice;
+        public int Row = 3; // 3 rows
+        public int Col = 4; // 4 columns per row
+
+        // Fullscreen state tracking
+        private bool _isFullscreen = false;
+        private int _fullscreenCameraIndex = -1;
+        private readonly object _fullscreenLock = new object();
+
+        // AI Detection Variables
+        private static readonly HttpClient httpClient = CreateHttpClient();
+        private readonly Dictionary<string, string> predictionCache = new Dictionary<string, string>();
+        private readonly object cacheLock = new object();
+        private DateTime lastCacheCleanup = DateTime.Now;
+        private const int CACHE_CLEANUP_INTERVAL_MS = 30000;
+        private const string API_URL = "http://127.0.0.1:8000/predict";
+
+        // Detection overlay
+        private readonly List<List<Detection>> _cameraDetections = new List<List<Detection>>();
+        private readonly System.Windows.Forms.Timer _detectionTimer = new System.Windows.Forms.Timer();
+        private readonly System.Windows.Forms.Timer _detectionCleanupTimer = new System.Windows.Forms.Timer();
+
+        // Store frame for AI detection processing
+        private readonly Dictionary<int, Bitmap> _latestFrames = new Dictionary<int, Bitmap>();
+        private readonly object _frameStoreLock = new object();
+
+        // Detection processing flags to prevent recursion
+        private readonly HashSet<int> _processsingDetection = new HashSet<int>();
+        private readonly object _detectionProcessLock = new object();
+
+        // Detection throttling and concurrency
+        private readonly SemaphoreSlim _detectionConcurrency = new SemaphoreSlim(4); // limit concurrent requests
+        private readonly Dictionary<int, DateTime> _lastDetectAt = new Dictionary<int, DateTime>();
+        private const int DETECT_MIN_INTERVAL_MS = 100; // per-camera min interval (≈10 FPS); adjust down to 50 for ~20 FPS
+        private const int DETECTION_TIMER_INTERVAL_MS = 150; // drive scheduling loop cadence
+        private const int MAX_DETECT_WIDTH = 1280; // resize width before sending to AI
+        private const long JPEG_QUALITY = 75L; // JPEG quality for request payload
+
+        // MySQL Connection
+        MySqlConnection connection = new MySqlConnection(ClassSystemConfig.Ins.m_ClsCommon.connectionString);
+
+        #endregion
+
+        public Form1()
+        {
+            ClassSystemConfig.Ins.m_ClsCommon.StartupLoadingForm();
+
+            InitializeComponent();
+            // Enable keyboard events
+            this.KeyPreview = true;
+            this.WindowState = FormWindowState.Maximized;
+
+            // Handle process exit events to ensure cleanup
+            AppDomain.CurrentDomain.ProcessExit += CurrentDomain_ProcessExit;
+            AppDomain.CurrentDomain.UnhandledException += CurrentDomain_UnhandledException;
+            Application.ApplicationExit += Application_ApplicationExit;
+
+            // Handle Windows shutdown/logoff
+            Microsoft.Win32.SystemEvents.SessionEnding += SystemEvents_SessionEnding;
+
+            // Initialize detection components
+            InitializeDetectionSystem();
+        }
+
+        #region Form Event Handlers
+        private void Form1_Load(object sender, EventArgs e)
+        {
+            try
+            {
+                Console.WriteLine("\n=== CameraManager Form1_Load Started ===");
+
+                InitializeUI();
+                LoadCameraList();
+
+                Console.WriteLine($"Camera Configuration: {NumCameras} cameras, {Row}x{Col} grid");
+
+                LayoutCameraSpreadView();
+                UpdateCameraLogInvoke(this);
+                Thread.Sleep(1000);
+                Console.WriteLine("? Form1_Load completed");
+                ClassSystemConfig.Ins.m_ClsCommon.StopStartupLoadingForm();
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Form1_Load error: {ex.Message}");
+                FileLogger.LogException(ex, "Form1_Load");
+            }
+        }
+
+        private void DisplayTimer_Tick(object sender, EventArgs e)
+        {
+            if (_isShuttingDown) return;
+
+            try
+            {
+                for (int i = 0; i < NumCameras && i < _mmfs.Count && i < _pictureboxes.Count; i++)
+                {
+                    UpdatePictureBox(i);
+                }
+            }
+            catch (Exception ex)
+            {
+                if (!_isShuttingDown)
+                {
+                    FileLogger.LogException(ex, "DisplayTimer_Tick");
+                }
+            }
+        }
+
+        private void Form1_KeyDown(object sender, KeyEventArgs e)
+        {
+            try
+            {
+                FileLogger.Log($"?? Key pressed: {e.KeyCode}, Fullscreen: {_isFullscreen}, Camera: {_fullscreenCameraIndex}");
+                Console.WriteLine($"?? Key pressed: {e.KeyCode}, Fullscreen: {_isFullscreen}, Camera: {_fullscreenCameraIndex}");
+
+                // Handle ESC first - always exit fullscreen if active
+                if (e.KeyCode == Keys.Escape)
+                {
+                    if (_isFullscreen)
+                    {
+                        FileLogger.Log("?? ESC pressed - Forcing exit fullscreen mode");
+                        Console.WriteLine("?? ESC pressed - Forcing exit fullscreen mode");
+
+                        lock (_fullscreenLock)
+                        {
+                            ExitFullscreen();
+                        }
+                        e.Handled = true;
+                        return;
+                    }
+                    else
+                    {
+                        FileLogger.Log("?? ESC pressed but not in fullscreen mode");
+                        Console.WriteLine("?? ESC pressed but not in fullscreen mode");
+                    }
+                    e.Handled = true;
+                    return;
+                }
+
+                // Handle F1-F12 keys for camera selection
+                else if (e.KeyCode >= Keys.F1 && e.KeyCode <= Keys.F12)
+                {
+                    int cameraIndex = e.KeyCode - Keys.F1;
+                    if (cameraIndex < NumCameras)
+                    {
+                        FileLogger.Log($"?? F{cameraIndex + 1} pressed - Toggling camera {cameraIndex + 1}");
+                        Console.WriteLine($"?? F{cameraIndex + 1} pressed - Toggling camera {cameraIndex + 1}");
+
+                        lock (_fullscreenLock)
+                        {
+                            ToggleFullscreen(cameraIndex);
+                        }
+                        e.Handled = true;
+                    }
+                    else
+                    {
+                        Console.WriteLine($"?? F{cameraIndex + 1} pressed but only {NumCameras} cameras available");
+                    }
+                }
+
+                // Handle number keys 1-9 for camera selection
+                else if (e.KeyCode >= Keys.D1 && e.KeyCode <= Keys.D9)
+                {
+                    int cameraIndex = e.KeyCode - Keys.D1;
+
+                    if (cameraIndex < NumCameras)
+                    {
+                        FileLogger.Log($"?? Number {cameraIndex + 1} pressed - Toggling camera {cameraIndex + 1}");
+                        Console.WriteLine($"?? Number {cameraIndex + 1} pressed - Toggling camera {cameraIndex + 1}");
+
+                        lock (_fullscreenLock)
+                        {
+                            if (_isFullscreen && _fullscreenCameraIndex == cameraIndex)
+                            {
+                                Console.WriteLine($"?? Camera {cameraIndex + 1} already in fullscreen - exiting");
+                                ExitFullscreen();
+                            }
+                            else
+                            {
+                                Console.WriteLine($"?? Switching to Camera {cameraIndex + 1} fullscreen");
+                                EnterFullscreen(cameraIndex);
+                            }
+                        }
+                        e.Handled = true;
+                    }
+                    else
+                    {
+                        Console.WriteLine($"?? Number {cameraIndex + 1} pressed but only {NumCameras} cameras available");
+                        Console.WriteLine($"?? Available cameras: 1-{NumCameras} (Press F1-F{NumCameras} or 1-{Math.Min(NumCameras, 9)})");
+                    }
+                }
+
+                // Handle numpad keys 1-9 for camera selection
+                else if (e.KeyCode >= Keys.NumPad1 && e.KeyCode <= Keys.NumPad9)
+                {
+                    int cameraIndex = e.KeyCode - Keys.NumPad1;
+
+                    if (cameraIndex < NumCameras)
+                    {
+                        FileLogger.Log($"?? Numpad {cameraIndex + 1} pressed - Toggling camera {cameraIndex + 1}");
+                        Console.WriteLine($"?? Numpad {cameraIndex + 1} pressed - Toggling camera {cameraIndex + 1}");
+
+                        lock (_fullscreenLock)
+                        {
+                            if (_isFullscreen && _fullscreenCameraIndex == cameraIndex)
+                            {
+                                Console.WriteLine($"?? Camera {cameraIndex + 1} already in fullscreen - exiting");
+                                ExitFullscreen();
+                            }
+                            else
+                            {
+                                Console.WriteLine($"?? Switching to Camera {cameraIndex + 1} fullscreen");
+                                EnterFullscreen(cameraIndex);
+                            }
+                        }
+                        e.Handled = true;
+                    }
+                    else
+                    {
+                        Console.WriteLine($"?? Numpad {cameraIndex + 1} pressed but only {NumCameras} cameras available");
+                    }
+                }
+
+                // Show help with H key
+                else if (e.KeyCode == Keys.H || (e.Control && e.KeyCode == Keys.H))
+                {
+                    ShowKeyboardShortcuts();
+                    e.Handled = true;
+                }
+
+                // Test detection overlay
+                else if (e.KeyCode == Keys.T)
+                {
+                    FileLogger.Log("?? Testing detection overlay with fake detections");
+                    TestDetectionOverlay();
+                    e.Handled = true;
+                }
+
+                // Emergency shutdown with Ctrl+Alt+X
+                else if (e.Control && e.Alt && e.KeyCode == Keys.X)
+                {
+                    FileLogger.Log("?? EMERGENCY SHUTDOWN HOTKEY PRESSED (Ctrl+Alt+X)");
+                    EmergencyShutdown();
+                    e.Handled = true;
+                    Application.Exit();
+                }
+
+                // Force kill workers with Ctrl+Shift+K
+                else if (e.Control && e.Shift && e.KeyCode == Keys.K)
+                {
+                    FileLogger.Log("?? FORCE KILL WORKERS HOTKEY PRESSED (Ctrl+Shift+K)");
+                    ForceKillAllCameraWorkers();
+                    e.Handled = true;
+                }
+
+                // Reload camera list with Ctrl+R
+                else if (e.Control && e.KeyCode == Keys.R)
+                {
+                    FileLogger.Log("?? RELOAD CAMERA LIST HOTKEY PRESSED (Ctrl+R)");
+                    ReloadCameraList();
+                    e.Handled = true;
+                }
+
+                // Debug fullscreen state with Ctrl+D
+                else if (e.Control && e.KeyCode == Keys.D)
+                {
+                    DebugFullscreenState();
+                    e.Handled = true;
+                }
+
+                // Force exit fullscreen with Ctrl+E
+                else if (e.Control && e.KeyCode == Keys.E)
+                {
+                    Console.WriteLine("?? FORCE EXIT FULLSCREEN HOTKEY PRESSED (Ctrl+E)");
+                    FileLogger.Log("?? FORCE EXIT FULLSCREEN HOTKEY PRESSED (Ctrl+E)");
+                    ForceExitFullscreen();
+                    e.Handled = true;
+                }
+            }
+            catch (Exception ex)
+            {
+                FileLogger.LogException(ex, "Form1_KeyDown");
+                Console.WriteLine($"? Form1_KeyDown error: {ex.Message}");
+            }
+        }
+
+        #endregion
+
+        #region Button Event Handlers
+
+        private void btnHideSetting_Click(object sender, EventArgs e)
+        {
+            try
+            {
+                panelSetting.Visible = !panelSetting.Visible;
+                FileLogger.Log($"Setting panel visibility toggled: {panelSetting.Visible}");
+            }
+            catch (Exception ex)
+            {
+                FileLogger.LogException(ex, "btnHideSetting_Click");
+            }
+        }
+
+        private void btnMinimize_Click(object sender, EventArgs e)
+        {
+            try
+            {
+                this.WindowState = FormWindowState.Minimized;
+                FileLogger.Log("Window minimized");
+            }
+            catch (Exception ex)
+            {
+                FileLogger.LogException(ex, "btnMinimize_Click");
+            }
+        }
+
+        private void btnMaximize_Click(object sender, EventArgs e)
+        {
+            try
+            {
+                if (this.WindowState == FormWindowState.Maximized)
+                {
+                    this.WindowState = FormWindowState.Normal;
+                    FileLogger.Log("Window restored to normal");
+                }
+                else
+                {
+                    this.WindowState = FormWindowState.Maximized;
+                    FileLogger.Log("Window maximized");
+                }
+            }
+            catch (Exception ex)
+            {
+                FileLogger.LogException(ex, "btnMaximize_Click");
+            }
+        }
+
+        private void btnExit_Click(object sender, EventArgs e)
+        {
+            try
+            {
+                FileLogger.Log("Exit button clicked - Closing application");
+                this.Close();
+            }
+            catch (Exception ex)
+            {
+                FileLogger.LogException(ex, "btnExit_Click");
+            }
+        }
+
+        private void btnStartCamera_Click(object sender, EventArgs e)
+        {
+            try
+            {
+                FileLogger.Log("?? Start Camera button clicked");
+                ClassSystemConfig.Ins.m_ClsCommon.StartLoadingForm();
+
+                btnStartCamera.Enabled = false;
+                this.Cursor = Cursors.WaitCursor;
+
+                StartCameraSystem();
+
+                btnStopCamera.Enabled = true;
+                this.Cursor = Cursors.Default;
+
+                FileLogger.Log("? Camera system start initiated");
+                ClassSystemConfig.Ins.m_ClsCommon.StopLoadingForm();
+                MessageBox.Show("Camera system started successfully!", "Start Camera",
+                              MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+            catch (Exception ex)
+            {
+                FileLogger.LogException(ex, "btnStartCamera_Click");
+
+                btnStartCamera.Enabled = true;
+                btnStopCamera.Enabled = false;
+                this.Cursor = Cursors.Default;
+
+                MessageBox.Show($"Error starting camera system: {ex.Message}", "Start Camera Error",
+                              MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        private void btnStopCamera_Click(object sender, EventArgs e)
+        {
+            try
+            {
+                FileLogger.Log("?? Stop Camera button clicked");
+
+                btnStopCamera.Enabled = false;
+                btnStartCamera.Enabled = false;
+                this.Cursor = Cursors.WaitCursor;
+
+                DisplayTimer?.Stop();
+                _detectionTimer?.Stop();
+                _detectionCleanupTimer?.Stop();
+
+                lock (_cameraDetections)
+                {
+                    for (int i = 0; i < _cameraDetections.Count; i++)
+                    {
+                        _cameraDetections[i].Clear();
+                    }
+                }
+
+                lock (_frameStoreLock)
+                {
+                    foreach (var frame in _latestFrames.Values)
+                    {
+                        try { frame?.Dispose(); } catch { }
+                    }
+                    _latestFrames.Clear();
+                }
+
+                foreach (var pictureBox in _pictureboxes)
+                {
+                    try
+                    {
+                        if (!pictureBox.IsDisposed)
+                        {
+                            var oldImage = pictureBox.Image;
+                            pictureBox.Image = null;
+                            oldImage?.Dispose();
+
+                            if (pictureBox.Controls.Count > 0)
+                            {
+                                pictureBox.Controls[0].Visible = true;
+                            }
+
+                            pictureBox.Invalidate();
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        FileLogger.LogException(ex, $"Clear PictureBox");
+                    }
+                }
+
+                EmergencyShutdown();
+
+                this.Cursor = Cursors.Default;
+                btnStartCamera.Enabled = true;
+                btnStopCamera.Enabled = false;
+
+                GC.Collect();
+                GC.WaitForPendingFinalizers();
+                GC.Collect();
+
+                FileLogger.Log("?? Camera system successfully stopped");
+                MessageBox.Show("Camera system stopped successfully!", "Stop Camera",
+                              MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+            catch (Exception ex)
+            {
+                FileLogger.LogException(ex, "btnStopCamera_Click");
+
+                this.Cursor = Cursors.Default;
+                btnStartCamera.Enabled = true;
+                btnStopCamera.Enabled = false;
+
+                MessageBox.Show($"Error stopping camera system: {ex.Message}", "Stop Camera Error",
+                              MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        private void btnSetting_Click(object sender, EventArgs e)
+        {
+            try
+            {
+                ChangeButtonColorClick(sender);
+                ClassSystemConfig.Ins.m_FrmParamCamera.Show();
+                ClassSystemConfig.Ins.m_FrmParamCamera.ShowOnScreen();
+                ClassSystemConfig.Ins.m_ClsFunc.SaveLog(ClassFunction.SAVING_LOG_TYPE.HANDLER_CLICKED,
+                                                        "Clicked Camera Setting",
+                                                        ClassSystemConfig.Ins.m_ClsCommon.IsSaveLog_Local, true);
+                FileLogger.Log("Camera settings opened");
+            }
+            catch (Exception ex)
+            {
+                FileLogger.LogException(ex, "btnSetting_Click");
+            }
+        }
+
+        private void ChangeButtonColorClick(object sender)
+        {
+            try
+            {
+                if ((Button)sender == btnAlarm)
+                {
+                    btnAlarm.BackColor = Color.DeepSkyBlue;
+                    btnSetting.BackColor = Color.Aquamarine;
+                    btnLogView.BackColor = Color.Aquamarine;
+                }
+                else if ((Button)sender == btnSetting)
+                {
+                    btnAlarm.BackColor = Color.Aquamarine;
+                    btnSetting.BackColor = Color.DeepSkyBlue;
+                    btnLogView.BackColor = Color.Aquamarine;
+                }
+                else if ((Button)sender == btnLogView)
+                {
+                    btnAlarm.BackColor = Color.Aquamarine;
+                    btnSetting.BackColor = Color.Aquamarine;
+                    btnLogView.BackColor = Color.DeepSkyBlue;
+                }
+            }
+            catch (Exception ex)
+            {
+                FileLogger.LogException(ex, "ChangeButtonColorClick");
+            }
+        }
+
+        private void Form1_FormClosing(object sender, FormClosingEventArgs e)
+        {
+            try
+            {
+                _isShuttingDown = true;
+                FileLogger.Log("\n=== Application Shutdown Started ===");
+
+                DisplayTimer?.Stop();
+                _detectionTimer?.Stop();
+                _detectionTimer?.Dispose();
+                _detectionCleanupTimer?.Stop();
+                _detectionCleanupTimer?.Dispose();
+
+                lock (_cameraDetections)
+                {
+                    for (int i = 0; i < _cameraDetections.Count; i++)
+                    {
+                        _cameraDetections[i].Clear();
+                    }
+                }
+
+                lock (_frameStoreLock)
+                {
+                    foreach (var frame in _latestFrames.Values)
+                    {
+                        try { frame?.Dispose(); } catch { }
+                    }
+                    _latestFrames.Clear();
+                }
+
+                ForceKillAllCameraWorkers();
+
+                foreach (var supervisor in _supervisors)
+                {
+                    try { supervisor?.Dispose(); } catch { }
+                }
+
+                foreach (var mmf in _mmfs)
+                {
+                    try { mmf?.Dispose(); } catch { }
+                }
+                foreach (var mutex in _mutexes)
+                {
+                    try { mutex?.Close(); mutex?.Dispose(); } catch { }
+                }
+
+                foreach (var pictureBox in _pictureboxes)
+                {
+                    try { pictureBox?.Image?.Dispose(); } catch { }
+                }
+
+                FileLogger.Log("? Application shutdown completed successfully");
+            }
+            catch (Exception ex)
+            {
+                FileLogger.LogException(ex, "Form1_FormClosing");
+            }
+        }
+
+        #endregion
+
+        #region AI Detection Classes
+        public class Detection
+        {
+            public string label { get; set; }
+            public double x1 { get; set; }
+            public double y1 { get; set; }
+            public double x2 { get; set; }
+            public double y2 { get; set; }
+            public double score { get; set; }
+            public DateTime timestamp { get; set; } = DateTime.Now;
+        }
+
+        private void InitializeDetectionSystem()
+        {
+            try
+            {
+                for (int i = 0; i < NumCameras; i++)
+                {
+                    _cameraDetections.Add(new List<Detection>());
+                }
+
+                _detectionTimer.Interval = DETECTION_TIMER_INTERVAL_MS;
+                _detectionTimer.Tick += DetectionTimer_Tick;
+                _detectionTimer.Start();
+
+                _detectionCleanupTimer.Interval = 100;
+                _detectionCleanupTimer.Tick += DetectionCleanupTimer_Tick;
+                _detectionCleanupTimer.Start();
+
+                FileLogger.Log("? AI Detection system initialized");
+            }
+            catch (Exception ex)
+            {
+                FileLogger.LogException(ex, "InitializeDetectionSystem");
+            }
+        }
+
+        private void DetectionCleanupTimer_Tick(object sender, EventArgs e)
+        {
+            try
+            {
+                if (_isShuttingDown) return;
+
+                var currentTime = DateTime.Now;
+
+                lock (_cameraDetections)
+                {
+                    for (int cameraIndex = 0; cameraIndex < _cameraDetections.Count; cameraIndex++)
+                    {
+                        var detections = _cameraDetections[cameraIndex];
+                        int originalCount = detections.Count;
+
+                        detections.RemoveAll(d => (currentTime - d.timestamp).TotalMilliseconds > 2000);
+
+                        if (detections.Count != originalCount)
+                        {
+                            TriggerPaintEvent(cameraIndex, detections.Count);
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                FileLogger.LogException(ex, "DetectionCleanupTimer_Tick");
+            }
+        }
+
+        private async void DetectionTimer_Tick(object sender, EventArgs e)
+        {
+            try
+            {
+                if (_isShuttingDown) return;
+                // Schedule detection tasks per camera with throttling and concurrency limits
+                var now = DateTime.Now;
+                int maxIndex;
+                lock (_frameStoreLock) { maxIndex = _latestFrames.Count; }
+
+                for (int i = 0; i < maxIndex; i++)
+                {
+                    Bitmap frame = null;
+                    lock (_frameStoreLock)
+                    {
+                        if (!_latestFrames.ContainsKey(i)) continue;
+                        frame = (Bitmap)_latestFrames[i].Clone();
+                    }
+
+                    bool shouldProcess = false;
+                    lock (_detectionProcessLock)
+                    {
+                        if (!_processsingDetection.Contains(i))
+                        {
+                            if (!_lastDetectAt.TryGetValue(i, out var last) || (now - last).TotalMilliseconds >= DETECT_MIN_INTERVAL_MS)
+                            {
+                                _processsingDetection.Add(i);
+                                _lastDetectAt[i] = now;
+                                shouldProcess = true;
+                            }
+                        }
+                    }
+
+                    if (!shouldProcess)
+                    {
+                        frame.Dispose();
+                        continue;
+                    }
+
+                    _ = ProcessDetectionAsync(i, frame);
+                }
+            }
+            catch (Exception ex)
+            {
+                FileLogger.LogException(ex, "DetectionTimer_Tick");
+            }
+        }
+
+        private async Task ProcessDetectionAsync(int cameraIndex, Bitmap frame)
+        {
+            try
+            {
+                // Limit global concurrency; skip if at capacity to keep realtime
+                if (!await _detectionConcurrency.WaitAsync(0))
+                {
+                    frame.Dispose();
+                    lock (_detectionProcessLock)
+                    {
+                        _processsingDetection.Remove(cameraIndex);
+                    }
+                    return;
+                }
+
+                // Resize frame to reduce payload
+                using var resized = ResizeToMaxWidth(frame, MAX_DETECT_WIDTH);
+
+                // Encode JPEG with quality and to base64
+                var jpegBytes = EncodeJpeg(resized, JPEG_QUALITY);
+                string base64Image = Convert.ToBase64String(jpegBytes);
+
+                var payload = new { image = base64Image };
+                var json = JsonConvert.SerializeObject(payload);
+                using var content = new StringContent(json, Encoding.UTF8, "application/json");
+
+                using var response = await httpClient.PostAsync(API_URL, content);
+                if (!response.IsSuccessStatusCode)
+                {
+                    return;
+                }
+
+                var result = await response.Content.ReadAsStringAsync();
+                var detections = JsonConvert.DeserializeObject<List<Detection>>(result) ?? new List<Detection>();
+
+                lock (_cameraDetections)
+                {
+                    if (cameraIndex < _cameraDetections.Count)
+                    {
+                        _cameraDetections[cameraIndex].Clear();
+                        _cameraDetections[cameraIndex].AddRange(detections);
+                    }
+                }
+
+                if (detections.Count > 0)
+                {
+                    try { SaveDetectionImage(cameraIndex, frame, detections); } catch (Exception exSave) { FileLogger.LogException(exSave, "ProcessDetectionAsync -> SaveDetectionImage"); }
+                }
+
+                TriggerPaintEvent(cameraIndex, detections.Count);
+            }
+            catch (Exception ex)
+            {
+                FileLogger.LogException(ex, "ProcessDetectionAsync");
+            }
+            finally
+            {
+                try { frame.Dispose(); } catch { }
+                _detectionConcurrency.Release();
+                lock (_detectionProcessLock)
+                {
+                    _processsingDetection.Remove(cameraIndex);
+                }
+            }
+        }
+
+        private void TriggerPaintEvent(int cameraIndex, int detectionCount)
+        {
+            try
+            {
+                if (this.InvokeRequired)
+                {
+                    this.BeginInvoke(new Action(() => TriggerPaintEvent(cameraIndex, detectionCount)));
+                    return;
+                }
+
+                if (cameraIndex < _pictureboxes.Count && !_pictureboxes[cameraIndex].IsDisposed)
+                {
+                    var pictureBox = _pictureboxes[cameraIndex];
+                    pictureBox.Invalidate();
+                    pictureBox.Update();
+                }
+            }
+            catch (Exception ex)
+            {
+                FileLogger.LogException(ex, $"TriggerPaintEvent - Camera {cameraIndex + 1}");
+            }
+        }
+
+        private void DrawDetectionBoxes(Graphics graphics, List<Detection> detections, int imageWidth, int imageHeight)
+        {
+            try
+            {
+                if (graphics == null || detections == null) return;
+
+                foreach (var detection in detections)
+                {
+                    if (detection.score < 0.3) continue;
+
+                    int x1 = (int)(detection.x1 * imageWidth);
+                    int y1 = (int)(detection.y1 * imageHeight);
+                    int x2 = (int)(detection.x2 * imageWidth);
+                    int y2 = (int)(detection.y2 * imageHeight);
+
+                    using (var pen = new Pen(Color.Lime, 2))
+                    {
+                        Rectangle rect = new Rectangle(x1, y1, x2 - x1, y2 - y1);
+                        graphics.DrawRectangle(pen, rect);
+                    }
+
+                    string labelText = $"{detection.label} ({detection.score:F2})";
+                    using (var font = new Font("Arial", 11, FontStyle.Bold))
+                    {
+                        using (var textBrush = new SolidBrush(Color.White))
+                        {
+                            graphics.DrawString(labelText, font, textBrush, new PointF(x1 + 3, y1 - 20));
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                FileLogger.LogException(ex, "DrawDetectionBoxes");
+            }
+        }
+
+        // Save annotated image to folder structure yyyy/MM/dd/image_#.jpg
+        private void SaveDetectionImage(int cameraIndex, Bitmap frame, List<Detection> detections)
+        {
+            try
+            {
+                if (frame == null || detections == null || detections.Count == 0) return;
+
+                using (var annotated = (Bitmap)frame.Clone())
+                using (var g = Graphics.FromImage(annotated))
+                {
+                    DrawDetectionBoxes(g, detections, annotated.Width, annotated.Height);
+
+                    string baseRoot = null;
+                    try { baseRoot = ClassSystemConfig.Ins?.m_ClsCommon?.m_CommonPath; } catch { baseRoot = null; }
+                    if (string.IsNullOrWhiteSpace(baseRoot))
+                    {
+                        baseRoot = Path.Combine(Environment.CurrentDirectory, "Images");
+                    }
+
+                    var now = DateTime.Now;
+                    string saveDir = Path.Combine(baseRoot, now.ToString("yyyy"), now.ToString("MM"), now.ToString("dd"));
+                    Directory.CreateDirectory(saveDir);
+
+                    int nextIdx = GetNextImageIndex(saveDir);
+                    string filePath = Path.Combine(saveDir, $"image_{nextIdx}.jpg");
+
+                    annotated.Save(filePath, ImageFormat.Jpeg);
+                    FileLogger.Log($"Saved detection image (cam {cameraIndex + 1}): {filePath}");
+                }
+            }
+            catch (Exception ex)
+            {
+                FileLogger.LogException(ex, "SaveDetectionImage");
+            }
+        }
+
+        private int GetNextImageIndex(string directory)
+        {
+            try
+            {
+                if (!Directory.Exists(directory)) return 1;
+                int maxIdx = 0;
+                foreach (var file in Directory.GetFiles(directory, "image_*.jpg"))
+                {
+                    var name = Path.GetFileNameWithoutExtension(file);
+                    if (name.StartsWith("image_", StringComparison.OrdinalIgnoreCase))
+                    {
+                        if (int.TryParse(name.Substring(6), out int idx))
+                        {
+                            if (idx > maxIdx) maxIdx = idx;
+                        }
+                    }
+                }
+                return maxIdx + 1;
+            }
+            catch
+            {
+                return 1;
+            }
+        }
+
+        private static HttpClient CreateHttpClient()
+        {
+            var handler = new SocketsHttpHandler
+            {
+                PooledConnectionLifetime = TimeSpan.FromMinutes(2),
+                PooledConnectionIdleTimeout = TimeSpan.FromSeconds(30),
+                MaxConnectionsPerServer = 16,
+                AutomaticDecompression = DecompressionMethods.All,
+                EnableMultipleHttp2Connections = false
+            };
+
+            var client = new HttpClient(handler)
+            {
+                Timeout = TimeSpan.FromSeconds(2)
+            };
+            client.DefaultRequestVersion = HttpVersion.Version11;
+            client.DefaultVersionPolicy = HttpVersionPolicy.RequestVersionOrLower;
+            return client;
+        }
+
+        private static Bitmap ResizeToMaxWidth(Bitmap src, int maxWidth)
+        {
+            if (src == null) return null;
+            if (maxWidth <= 0 || src.Width <= maxWidth) return (Bitmap)src.Clone();
+
+            double scale = (double)maxWidth / src.Width;
+            int newW = maxWidth;
+            int newH = Math.Max(1, (int)Math.Round(src.Height * scale));
+
+            var dst = new Bitmap(newW, newH);
+            using (var g = Graphics.FromImage(dst))
+            {
+                g.CompositingQuality = System.Drawing.Drawing2D.CompositingQuality.HighQuality;
+                g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.HighQuality;
+                g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
+                g.DrawImage(src, new Rectangle(0, 0, newW, newH));
+            }
+            return dst;
+        }
+
+        private static byte[] EncodeJpeg(Bitmap bmp, long quality)
+        {
+            using var ms = new MemoryStream();
+            var encoder = ImageCodecInfo.GetImageEncoders().FirstOrDefault(e => e.MimeType == "image/jpeg");
+            if (encoder == null)
+            {
+                bmp.Save(ms, ImageFormat.Jpeg);
+                return ms.ToArray();
+            }
+            var encParams = new EncoderParameters(1);
+            encParams.Param[0] = new EncoderParameter(System.Drawing.Imaging.Encoder.Quality, quality);
+            bmp.Save(ms, encoder, encParams);
+            return ms.ToArray();
+        }
+
+        private void TestDetectionOverlay()
+        {
+            try
+            {
+                var testDetections = new List<Detection>
+                {
+                    new Detection
+                    {
+                        label = "TEST_PERSON",
+                        x1 = 0.2, y1 = 0.3, x2 = 0.5, y2 = 0.7,
+                        score = 0.95
+                    }
+                };
+
+                if (_pictureboxes.Count > 0 && !_pictureboxes[0].IsDisposed)
+                {
+                    var pictureBox = _pictureboxes[0];
+                    pictureBox.Invalidate();
+                }
+            }
+            catch (Exception ex)
+            {
+                FileLogger.LogException(ex, "TestDetectionOverlay");
+            }
+        }
+
+        #endregion
+
+        #region Core Implementation Methods
+
+        private void InitializeUI()
+        {
+            try
+            {
+                LoadDeviceConfig(false);
+
+                ClassSystemConfig.Ins.m_CameraList.InitializeUI(this);
+                ClassSystemConfig.Ins.m_FrmParamCamera.Innit(this);
+                FileLogger.Log("UI initialized successfully");
+            }
+            catch (Exception ex)
+            {
+                FileLogger.LogException(ex, "InitializeUI");
+            }
+        }
+
+        private void LoadCameraList()
+        {
+            try
+            {
+                Console.WriteLine("?? Loading camera list from database...");
+
+                ClassSystemConfig.Ins.m_ClsCommon.m_ListRtspCam.Clear();
+                ClassSystemConfig.Ins.m_ClsFunc.GetRtspUrls(connection, ClassSystemConfig.Ins.m_ClsCommon.m_ListRtspCam);
+
+                if (ClassSystemConfig.Ins.m_ClsCommon.m_ListRtspCam.Count > 0)
+                {
+                    Console.WriteLine($"?? Found {ClassSystemConfig.Ins.m_ClsCommon.m_ListRtspCam.Count} RTSP URLs in database");
+                    UpdateLayoutForCameraCount();
+                }
+                else
+                {
+                    Console.WriteLine("?? No RTSP URLs found in database, using default configuration");
+                    AddDefaultRtspUrls();
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"? Error in LoadCameraList: {ex.Message}");
+                FileLogger.LogException(ex, "LoadCameraList");
+                AddDefaultRtspUrls();
+            }
+        }
+
+        private void AddDefaultRtspUrls()
+        {
+            try
+            {
+                ClassSystemConfig.Ins.m_ClsCommon.m_ListRtspCam.Clear();
+                ClassSystemConfig.Ins.m_ClsCommon.m_ListRtspCam.AddRange(new List<string>
+                {
+                    "rtsp://admin:infiniq2025@10.29.98.55:554/cam/realmonitor?channel=1&subtype=1",
+                    "rtsp://admin:infiniq2025@10.29.98.56:554/cam/realmonitor?channel=1&subtype=1",
+                    "rtsp://admin:infiniq2025@10.29.98.57:554/cam/realmonitor?channel=1&subtype=1",
+                    "rtsp://admin:infiniq2025@10.29.98.58:554/cam/realmonitor?channel=1&subtype=1",
+                    "rtsp://admin:infiniq2025@10.29.98.59:554/cam/realmonitor?channel=1&subtype=1",
+                    "rtsp://admin:infiniq2025@10.29.98.60:554/cam/realmonitor?channel=1&subtype=1",
+                    "rtsp://admin:infiniq2025@10.29.98.61:554/cam/realmonitor?channel=1&subtype=1",
+                    "rtsp://admin:infiniq2025@10.29.98.62:554/cam/realmonitor?channel=1&subtype=1",
+                    "rtsp://admin:infiniq2025@10.29.98.63:554/cam/realmonitor?channel=1&subtype=1",
+                    "rtsp://admin:infiniq2025@10.29.98.64:554/cam/realmonitor?channel=1&subtype=1",
+                    "rtsp://admin:infiniq2025@10.29.98.53:554/cam/realmonitor?channel=1&subtype=1",
+                    "rtsp://admin:infiniq2025@10.29.98.54:554/cam/realmonitor?channel=1&subtype=1"
+                });
+
+                Console.WriteLine($"? Added {ClassSystemConfig.Ins.m_ClsCommon.m_ListRtspCam.Count} default RTSP URLs");
+            }
+            catch (Exception ex)
+            {
+                FileLogger.LogException(ex, "AddDefaultRtspUrls");
+            }
+        }
+
+        private void UpdateLayoutForCameraCount()
+        {
+            try
+            {
+                int cameraCount = ClassSystemConfig.Ins.m_ClsCommon.m_ListRtspCam.Count;
+
+                if (cameraCount <= 4)
+                {
+                    Row = 2; Col = 2;
+                }
+                else if (cameraCount <= 6)
+                {
+                    Row = 2; Col = 3;
+                }
+                else if (cameraCount <= 9)
+                {
+                    Row = 3; Col = 3;
+                }
+                else if (cameraCount <= 12)
+                {
+                    Row = 3; Col = 4;
+                }
+                else if (cameraCount <= 16)
+                {
+                    Row = 4; Col = 4;
+                }
+                else
+                {
+                    int sqrt = (int)Math.Ceiling(Math.Sqrt(cameraCount));
+                    Row = sqrt;
+                    Col = sqrt;
+                }
+
+                Console.WriteLine($"?? Updated layout for {cameraCount} cameras: {Row}x{Col} grid");
+            }
+            catch (Exception ex)
+            {
+                FileLogger.LogException(ex, "UpdateLayoutForCameraCount");
+            }
+        }
+
+        public void LayoutCameraSpreadView()
+        {
+            try
+            {
+                if (panelMain.InvokeRequired)
+                {
+                    panelMain.Invoke(new Action(() => LayoutCameraSpreadView()));
+                    return;
+                }
+
+                FileLogger.Log("Setting up dynamic camera layout...");
+
+                panelMain.Controls.Clear();
+                _pictureboxes.Clear();
+
+                tableLayoutPanelCamera = new TableLayoutPanel();
+                tableLayoutPanelCamera.Dock = DockStyle.Fill;
+                tableLayoutPanelCamera.ColumnCount = 1;
+                tableLayoutPanelCamera.RowCount = Row;
+                tableLayoutPanelCamera.ColumnStyles.Clear();
+                tableLayoutPanelCamera.RowStyles.Clear();
+
+                panelMain.Controls.Add(tableLayoutPanelCamera);
+
+                tableLayoutPanelDevice = new TableLayoutPanel[Row];
+
+                for (int i = 0; i < Row; i++)
+                {
+                    tableLayoutPanelCamera.RowStyles.Add(new RowStyle(SizeType.Percent, 100f / Row));
+
+                    tableLayoutPanelDevice[i] = new TableLayoutPanel();
+                    tableLayoutPanelCamera.Controls.Add(tableLayoutPanelDevice[i], 0, i);
+                    tableLayoutPanelDevice[i].Dock = DockStyle.Fill;
+                    tableLayoutPanelDevice[i].ColumnCount = Col;
+                    tableLayoutPanelDevice[i].RowCount = 1;
+
+                    for (int j = 0; j < Col; j++)
+                    {
+                        tableLayoutPanelDevice[i].ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f / Col));
+                    }
+                    tableLayoutPanelDevice[i].RowStyles.Add(new RowStyle(SizeType.Percent, 100f));
+                }
+
+                int indexCam = 0;
+                for (int row = 0; row < Row; row++)
+                {
+                    for (int col = 0; col < Col; col++)
+                    {
+                        if (indexCam < NumCameras)
+                        {
+                            var pictureBox = new PictureBox();
+                            pictureBox.Name = $"pictureBox{indexCam + 1}";
+                            pictureBox.Dock = DockStyle.Fill;
+                            pictureBox.SizeMode = PictureBoxSizeMode.StretchImage;
+                            pictureBox.BackColor = Color.Black;
+                            pictureBox.BorderStyle = BorderStyle.FixedSingle;
+
+                            var label = new Label();
+                            label.Text = $"CAM {indexCam + 1}\n(Press {indexCam + 1}, F{indexCam + 1}, Double-click for fullscreen)\n(ESC to exit fullscreen)";
+                            label.ForeColor = Color.White;
+                            label.BackColor = Color.Transparent;
+                            label.Font = new Font("Arial", 9, FontStyle.Bold);
+                            label.TextAlign = ContentAlignment.MiddleCenter;
+                            label.Dock = DockStyle.Fill;
+                            label.Anchor = AnchorStyles.None;
+
+                            pictureBox.Controls.Add(label);
+
+                            int cameraIndex = indexCam;
+                            pictureBox.DoubleClick += (sender, e) => ToggleFullscreen(cameraIndex);
+                            pictureBox.Cursor = Cursors.Hand;
+
+                            pictureBox.Click += (sender, e) =>
+                            {
+                                if (!_isFullscreen)
+                                {
+                                    Console.WriteLine($"Camera {cameraIndex + 1} selected");
+                                }
+                            };
+
+                            pictureBox.MouseEnter += (sender, e) =>
+                            {
+                                if (!_isFullscreen || _fullscreenCameraIndex != cameraIndex)
+                                {
+                                    pictureBox.BorderStyle = BorderStyle.Fixed3D;
+                                }
+                            };
+
+                            pictureBox.MouseLeave += (sender, e) =>
+                            {
+                                if (!_isFullscreen || _fullscreenCameraIndex != cameraIndex)
+                                {
+                                    pictureBox.BorderStyle = BorderStyle.FixedSingle;
+                                }
+                            };
+
+                            pictureBox.Paint += (sender, e) => OnPictureBoxPaint(sender, e, cameraIndex);
+
+                            tableLayoutPanelDevice[row].Controls.Add(pictureBox, col, 0);
+                            _pictureboxes.Add(pictureBox);
+
+                            indexCam++;
+                        }
+                    }
+                }
+
+                FileLogger.Log($"? Created dynamic layout with {_pictureboxes.Count} camera PictureBoxes");
+            }
+            catch (Exception ex)
+            {
+                FileLogger.LogException(ex, "LayoutCameraSpreadView");
+            }
+        }
+
+        private void OnPictureBoxPaint(object sender, PaintEventArgs e, int cameraIndex)
+        {
+            try
+            {
+                if (_isShuttingDown || cameraIndex >= _cameraDetections.Count) return;
+
+                var pictureBox = sender as PictureBox;
+                if (pictureBox?.Image == null) return;
+
+                if (pictureBox.Image != null)
+                {
+                    e.Graphics.DrawImage(pictureBox.Image, new Rectangle(0, 0, pictureBox.Width, pictureBox.Height));
+                }
+
+                List<Detection> detections = null;
+                lock (_cameraDetections)
+                {
+                    if (cameraIndex < _cameraDetections.Count && _cameraDetections[cameraIndex].Count > 0)
+                    {
+                        detections = new List<Detection>(_cameraDetections[cameraIndex]);
+                    }
+                }
+
+                if (detections?.Count > 0)
+                {
+                    DrawDetectionBoxes(e.Graphics, detections, pictureBox.Width, pictureBox.Height);
+                }
+            }
+            catch (Exception ex)
+            {
+                FileLogger.LogException(ex, $"OnPictureBoxPaint - Camera {cameraIndex}");
+            }
+        }
+
+        public void ChangeCameraSpreadView(int cameraIndex, bool spreadOut)
+        {
+            try
+            {
+                if (this.InvokeRequired)
+                {
+                    this.Invoke(new Action(() => ChangeCameraSpreadView(cameraIndex, spreadOut)));
+                    return;
+                }
+
+                if (spreadOut && cameraIndex >= 0)
+                {
+                    int row = cameraIndex / Col;
+                    int col = cameraIndex % Col;
+
+                    for (int i = 0; i < tableLayoutPanelCamera.RowCount; i++)
+                    {
+                        if (i == row)
+                        {
+                            tableLayoutPanelCamera.RowStyles[i] = new RowStyle(SizeType.Percent, 100f);
+                        }
+                        else
+                        {
+                            tableLayoutPanelCamera.RowStyles[i] = new RowStyle(SizeType.Absolute, 0f);
+                        }
+                    }
+
+                    for (int i = 0; i < tableLayoutPanelDevice[row].ColumnCount; i++)
+                    {
+                        if (i == col)
+                        {
+                            tableLayoutPanelDevice[row].ColumnStyles[i] = new ColumnStyle(SizeType.Percent, 100f);
+                        }
+                        else
+                        {
+                            tableLayoutPanelDevice[row].ColumnStyles[i] = new ColumnStyle(SizeType.Absolute, 0f);
+                        }
+                    }
+
+                    if (cameraIndex < _pictureboxes.Count)
+                    {
+                        _pictureboxes[cameraIndex].BorderStyle = BorderStyle.Fixed3D;
+                    }
+                }
+                else
+                {
+                    for (int i = 0; i < tableLayoutPanelCamera.RowCount; i++)
+                    {
+                        tableLayoutPanelCamera.RowStyles[i] = new RowStyle(SizeType.Percent, 100f / tableLayoutPanelCamera.RowCount);
+                    }
+
+                    for (int row = 0; row < Row; row++)
+                    {
+                        for (int i = 0; i < tableLayoutPanelDevice[row].ColumnCount; i++)
+                        {
+                            tableLayoutPanelDevice[row].ColumnStyles[i] = new ColumnStyle(SizeType.Percent, 100f / tableLayoutPanelDevice[row].ColumnCount);
+                        }
+                    }
+
+                    foreach (var pictureBox in _pictureboxes)
+                    {
+                        pictureBox.BorderStyle = BorderStyle.FixedSingle;
+                    }
+                }
+
+                tableLayoutPanelCamera.PerformLayout();
+                for (int i = 0; i < Row; i++)
+                {
+                    tableLayoutPanelDevice[i].PerformLayout();
+                }
+
+                Application.DoEvents();
+            }
+            catch (Exception ex)
+            {
+                FileLogger.LogException(ex, "ChangeCameraSpreadView");
+            }
+        }
+
+        #endregion
+
+        #region Save/Load Config
+        public void SaveDeviceConfig(bool ShowMessage)
+        {
+            string file_name = Directory.GetCurrentDirectory() + @"\Config Setting\DeviceConfig.ini";
+
+            if (!System.IO.File.Exists(file_name))
+            {
+                System.IO.Directory.CreateDirectory(Directory.GetCurrentDirectory() + @"\Config Setting");
+            }
+
+            try
+            {
+                using (StreamWriter objWriter = new StreamWriter(file_name))
+                {
+                    objWriter.WriteLine("[PROGRAM NAME]  " + ClassCommon.ProgramName);
+                    objWriter.WriteLine("[MACHINE NAME]  " + ClassCommon.MachineName);
+
+                    // IP CAM VISION
+                    //for (int iControl = 0; iControl < ClassCommon.MaxDevice; iControl++)
+                    //    objWriter.WriteLine(String.Format("[IP CAM VISION {0}]  {1}", iControl + 1, ClassSystemConfig.Ins.m_ClsCommon.m_ListIPCAM[iControl]));
+                    //for (int i = 0; i < ClassSystemConfig.Ins.m_ClsCommon.m_ListRtspCam.Count; i++)
+                    //{
+                    //    // Ghi vào t?p v?i tên camera t? 1 d?n 9
+                    //    objWriter.WriteLine("[RTSP CAMERA " + (i + 1) + "]  " + ClassSystemConfig.Ins.m_ClsCommon.m_ListRtspCam[i]);
+                    //}
+
+                    // LOGIN
+                    objWriter.WriteLine("[LOGIN USER]  " + ClassSystemConfig.Ins.m_ClsCommon.m_ListUserLogin[0]);
+                    objWriter.WriteLine("[LOGIN PASS]  " + "***");
+
+                    // SAVING
+                    objWriter.WriteLine("[IS SAVE IMG_LOCAL]  " + (ClassSystemConfig.Ins.m_ClsCommon.IsSaveImgOKNG_Local ? 1 : 0));
+                    objWriter.WriteLine("[IS SAVE GRAPHIC IMG LOCAL]  " + (ClassSystemConfig.Ins.m_ClsCommon.IsSaveImgGraphic_Local ? 1 : 0));
+                    objWriter.WriteLine("[IS SAVE LOG LOCAL]  " + (ClassSystemConfig.Ins.m_ClsCommon.IsSaveLog_Local ? 1 : 0));
+                    objWriter.WriteLine("[IS SAVE IMG_FTP]  " + (ClassSystemConfig.Ins.m_ClsCommon.IsSaveImgOKNG_FTP ? 1 : 0));
+                    objWriter.WriteLine("[IS SAVE GRAPHIC IMG FTP]  " + (ClassSystemConfig.Ins.m_ClsCommon.IsSaveImgGraphic_FTP ? 1 : 0));
+                    objWriter.WriteLine("[IS SAVE LOG FTP]  " + (ClassSystemConfig.Ins.m_ClsCommon.IsSaveLog_FTP ? 1 : 0));
+
+                    objWriter.WriteLine("[IS DELETE AUTO]  " + (ClassSystemConfig.Ins.m_ClsCommon.m_bAutoDeleteImg ? 1 : 0));
+                    objWriter.WriteLine("[PERIOD DELETE]  " + ClassSystemConfig.Ins.m_ClsCommon.m_iPeriodDelete);
+                    objWriter.WriteLine("[COMMON PATH]  " + ClassSystemConfig.Ins.m_ClsCommon.m_CommonPath);
+
+                    objWriter.WriteLine("[SHOW GRAPHIC]  " + (ClassSystemConfig.Ins.m_ClsCommon.m_bShowGraphic ? "1" : "0"));
+                    objWriter.WriteLine("[SHOW ORIGIN]  " + (ClassSystemConfig.Ins.m_ClsCommon.m_bShowOrigin ? "1" : "0"));
+                    objWriter.WriteLine("[SHOW PROGRESS STATUS]  " + (ClassSystemConfig.Ins.m_ClsCommon.m_bShowProgressStatus ? "1" : "0"));
+
+                    objWriter.Close();
+                }
+                if (ShowMessage)
+                {
+                    MessageBox.Show("Saved Configurations");
+                }
+            }
+            catch
+            {
+                if (ShowMessage)
+                {
+                    MessageBox.Show("Save Fail");
+                }
+            }
+
+        }
+        private void LoadDeviceConfig(bool ShowMessage)
+        {
+            string file_name = Directory.GetCurrentDirectory() + @"\Config Setting\DeviceConfig.ini";
+
+            if (!System.IO.Directory.Exists(Directory.GetCurrentDirectory() + @"\Config Setting"))
+            {
+                System.IO.Directory.CreateDirectory(Directory.GetCurrentDirectory() + @"\Config Setting");
+            }
+            else
+            {
+                try
+                {
+                    try
+                    {
+                        ClassCommon.ProgramName = ClassCommon.GetConfig(file_name, "PROGRAM NAME", "UT ALIGNMENT");
+                        ClassCommon.MachineName = ClassCommon.GetConfig(file_name, "MACHINE NAME", "MC #2");
+
+                        //for (int i = 0; i < 9; i++)
+                        //{
+                        //    // Ghi vào t?p v?i tên camera t? 1 d?n 9
+                        //    ClassSystemConfig.Ins.m_ClsCommon.m_ListRtspCam.Add("");
+                        //    ClassSystemConfig.Ins.m_ClsCommon.m_ListRtspCam[i] = ClassCommon.GetConfig(file_name, "RTSP CAMERA " + (i + 1), "");
+                        //}
+
+                        ClassSystemConfig.Ins.m_ClsCommon.m_ListUserLogin[0] = ClassCommon.GetConfig(file_name, "LOGIN USER", "Admin");
+                        ClassSystemConfig.Ins.m_ClsCommon.m_ListPasswordLogin[0] = ClassCommon.GetConfig(file_name, "LOGIN PASS", "");
+
+                        ClassSystemConfig.Ins.m_ClsCommon.IsSaveImgOKNG_Local = (ClassCommon.GetConfig(file_name, "IS SAVE IMG_LOCAL", "1").Trim() == "1") ? true : false;
+                        ClassSystemConfig.Ins.m_ClsCommon.IsSaveImgGraphic_Local = (ClassCommon.GetConfig(file_name, "IS SAVE GRAPHIC IMG LOCAL", "1").Trim() == "1") ? true : false;
+                        ClassSystemConfig.Ins.m_ClsCommon.IsSaveLog_Local = (ClassCommon.GetConfig(file_name, "IS SAVE LOG LOCAL", "1").Trim() == "1") ? true : false;
+                        ClassSystemConfig.Ins.m_ClsCommon.IsSaveImgGraphic_FTP = (ClassCommon.GetConfig(file_name, "IS SAVE GRAPHIC IMG FTP", "1").Trim() == "1") ? true : false;
+
+                        ClassSystemConfig.Ins.m_ClsCommon.m_bAutoDeleteImg = (ClassCommon.GetConfig(file_name, "IS DELETE AUTO", "1").Trim() == "1") ? true : false;
+                        ClassSystemConfig.Ins.m_ClsCommon.m_iPeriodDelete = ClassSystemConfig.Ins.m_ClsCommon.ConvertStringToInt(ClassCommon.GetConfig(file_name, "PERIOD DELETE", "30"), 15);
+                        ClassSystemConfig.Ins.m_ClsCommon.m_CommonPath = ClassCommon.GetConfig(file_name, "COMMON PATH", Directory.GetCurrentDirectory());
+
+                        ClassSystemConfig.Ins.m_ClsCommon.m_bShowGraphic = (ClassCommon.GetConfig(file_name, "SHOW GRAPHIC", "1").Trim() == "1") ? true : false;
+                        ClassSystemConfig.Ins.m_ClsCommon.m_bShowOrigin = false; // (ClassCommon.GetConfig(file_name, "SHOW ORIGIN", "1").Trim() == "1") ? true : false;
+                        ClassSystemConfig.Ins.m_ClsCommon.m_bShowProgressStatus = (ClassCommon.GetConfig(file_name, "SHOW PROGRESS STATUS", "0").Trim() == "1") ? true : false;
+
+                        ClassSystemConfig.Ins.m_ClsCommon.m_bAutoReconnect = (ClassCommon.GetConfig(file_name, "AUTO RECONNECT", "0").Trim() == "1") ? true : false;
+                        ClassSystemConfig.Ins.m_ClsCommon.IsSaveByFTP = (ClassCommon.GetConfig(file_name, "IS_FTP_SAVING", "1").Trim() == "1") ? true : false;
+
+                        ClassSystemConfig.Ins.m_ClsCommon.m_iTimeBetween2Trigger = ClassSystemConfig.Ins.m_ClsCommon.ConvertStringToInt(ClassCommon.GetConfig(file_name, "TIMEOUT GET IMAGE", "1000"), 1000);
+                        ClassSystemConfig.Ins.m_ClsCommon.m_iModeTriggerLight = ClassSystemConfig.Ins.m_ClsCommon.ConvertStringToInt(ClassCommon.GetConfig(file_name, "TRIGGER LIGHT MODE", "1"), 1);
+                        ClassSystemConfig.Ins.m_ClsCommon.m_iTimeDelayTriggerCAM = ClassSystemConfig.Ins.m_ClsCommon.ConvertStringToInt(ClassCommon.GetConfig(file_name, "DELAY TRIGGER CAM MS", "100"), 100);
+                        ClassSystemConfig.Ins.m_ClsCommon.m_iTimeDelaySendReady = ClassSystemConfig.Ins.m_ClsCommon.ConvertStringToInt(ClassCommon.GetConfig(file_name, "DELAY SEND READY MS", "50"), 50);
+                        ClassSystemConfig.Ins.m_ClsCommon.m_iTimeoutCheckReady = ClassSystemConfig.Ins.m_ClsCommon.ConvertStringToInt(ClassCommon.GetConfig(file_name, "TIMEOUT CHECK READY MS", "2000"), 2000);
+                        ClassSystemConfig.Ins.m_ClsCommon.m_iFormatSavingMode = ClassSystemConfig.Ins.m_ClsCommon.ConvertStringToInt(ClassCommon.GetConfig(file_name, "SAVING JPG MODE", "0"), 0);
+                        ClassSystemConfig.Ins.m_ClsCommon.m_bCheckTimeoutReady = (ClassCommon.GetConfig(file_name, "CHECK TIMEOUT READY", "0").Trim() == "1") ? true : false;
+
+                    }
+                    catch { }
+
+                }
+                catch
+                {
+                    if (ShowMessage)
+                    {
+                        MessageBox.Show("Load Fail");
+                    }
+                }
+            }
+
+        }
+        #endregion
+
+        #region Fullscreen Control Methods
+        private void ToggleFullscreen(int cameraIndex)
+        {
+            try
+            {
+                if (_isShuttingDown) return;
+
+                if (cameraIndex < 0 || cameraIndex >= NumCameras)
+                {
+                    Console.WriteLine($"? Invalid camera index {cameraIndex + 1} (Available: 1-{NumCameras})");
+                    return;
+                }
+
+                lock (_fullscreenLock)
+                {
+                    if (_isFullscreen)
+                    {
+                        if (_fullscreenCameraIndex == cameraIndex)
+                        {
+                            ExitFullscreen();
+                        }
+                        else
+                        {
+                            EnterFullscreen(cameraIndex);
+                        }
+                    }
+                    else
+                    {
+                        EnterFullscreen(cameraIndex);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                FileLogger.LogException(ex, "ToggleFullscreen");
+                Console.WriteLine($"? ToggleFullscreen error: {ex.Message}");
+            }
+        }
+
+        private void EnterFullscreen(int cameraIndex)
+        {
+            try
+            {
+                if (cameraIndex < 0 || cameraIndex >= NumCameras) return;
+
+                _isFullscreen = true;
+                _fullscreenCameraIndex = cameraIndex;
+
+                ChangeCameraSpreadView(cameraIndex, true);
+
+                Console.WriteLine($"Camera {cameraIndex + 1} expanded to fullscreen (Press ESC to exit)");
+            }
+            catch (Exception ex)
+            {
+                FileLogger.LogException(ex, "EnterFullscreen");
+                Console.WriteLine($"? EnterFullscreen error: {ex.Message}");
+
+                _isFullscreen = false;
+                _fullscreenCameraIndex = -1;
+            }
+        }
+
+        public void ExitFullscreen()
+        {
+            try
+            {
+                if (!_isFullscreen)
+                {
+                    return;
+                }
+
+                if (this.InvokeRequired)
+                {
+                    this.Invoke(new Action(() => ExitFullscreen()));
+                    return;
+                }
+
+                _isFullscreen = false;
+                _fullscreenCameraIndex = -1;
+
+                ChangeCameraSpreadView(-1, false);
+
+                Console.WriteLine($"? Exited fullscreen - Returned to grid view");
+            }
+            catch (Exception ex)
+            {
+                FileLogger.LogException(ex, "ExitFullscreen");
+                Console.WriteLine($"? ExitFullscreen error: {ex.Message}");
+
+                _isFullscreen = false;
+                _fullscreenCameraIndex = -1;
+            }
+        }
+        #endregion
+
+        #region Helper and Utility Methods
+
+        public void ShowKeyboardShortcuts()
+        {
+            try
+            {
+                string shortcuts = $@"
+?? CAMERA MANAGER - KEYBOARD SHORTCUTS:
+
+?? CAMERA CONTROLS ({NumCameras} cameras available):
+• 1-9: Toggle fullscreen for Camera 1-9 (OPTIMIZED)
+  - Press number to enter fullscreen
+  - Press same number again to exit fullscreen
+  - Press different number to switch cameras
+• F1-F12: Toggle fullscreen for Camera 1-12
+• Numpad 1-9: Same as number keys 1-9
+• ESC: Exit fullscreen mode (ALWAYS WORKS)
+• Double-click: Toggle fullscreen for selected camera
+
+?? SYSTEM CONTROLS:
+• Ctrl+R: Reload camera list from database
+• Ctrl+Alt+X: Emergency shutdown
+• Ctrl+Shift+K: Force kill camera workers
+• Ctrl+E: Force exit fullscreen (emergency)
+• H: Show this help
+• T: Test detection overlay
+
+?? OPTIMIZED FEATURES:
+• Smart camera switching - no need to exit first
+• Reliable ESC key - always exits fullscreen
+• Number keys 1-{Math.Min(NumCameras, 9)} for quick access
+";
+
+                MessageBox.Show(shortcuts, "?? Camera Manager - Keyboard Shortcuts", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                FileLogger.Log("?? Optimized keyboard shortcuts displayed to user");
+
+                Console.WriteLine($"?? Help shown - Current config: {NumCameras} cameras in {Row}x{Col} grid");
+            }
+            catch (Exception ex)
+            {
+                FileLogger.LogException(ex, "ShowKeyboardShortcuts");
+            }
+        }
+
+        public void DebugFullscreenState()
+        {
+            try
+            {
+                Console.WriteLine("?? === FULLSCREEN DEBUG INFO ===");
+                Console.WriteLine($"?? _isFullscreen: {_isFullscreen}");
+                Console.WriteLine($"?? _fullscreenCameraIndex: {_fullscreenCameraIndex}");
+                Console.WriteLine($"?? NumCameras: {NumCameras}");
+                Console.WriteLine("?? === END DEBUG INFO ===");
+
+                FileLogger.Log($"DEBUG - Fullscreen: {_isFullscreen}, Camera: {_fullscreenCameraIndex}");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"? Debug error: {ex.Message}");
+                FileLogger.LogException(ex, "DebugFullscreenState");
+            }
+        }
+
+        public void ForceExitFullscreen()
+        {
+            try
+            {
+                Console.WriteLine("?? FORCE EXIT FULLSCREEN CALLED");
+                FileLogger.Log("?? FORCE EXIT FULLSCREEN CALLED");
+
+                _isFullscreen = false;
+                _fullscreenCameraIndex = -1;
+
+                if (this.InvokeRequired)
+                {
+                    this.Invoke(new Action(() => ForceExitFullscreen()));
+                    return;
+                }
+
+                LayoutCameraSpreadView();
+
+                Console.WriteLine("? FORCE EXIT FULLSCREEN COMPLETED");
+                FileLogger.Log("? FORCE EXIT FULLSCREEN COMPLETED");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"? ForceExitFullscreen error: {ex.Message}");
+                FileLogger.LogException(ex, "ForceExitFullscreen");
+            }
+        }
+
+        public void EmergencyShutdown()
+        {
+            try
+            {
+                FileLogger.Log("?? EMERGENCY SHUTDOWN INITIATED");
+                _isShuttingDown = true;
+
+                DisplayTimer?.Stop();
+                _detectionTimer?.Stop();
+                _detectionTimer?.Dispose();
+                _detectionCleanupTimer?.Stop();
+                _detectionCleanupTimer?.Dispose();
+
+                ForceKillAllCameraWorkers();
+
+                FileLogger.Log("? Emergency shutdown completed");
+            }
+            catch (Exception ex)
+            {
+                FileLogger.LogException(ex, "EmergencyShutdown");
+            }
+        }
+
+        private void ForceKillAllCameraWorkers()
+        {
+            try
+            {
+                FileLogger.Log("?? EMERGENCY: Force killing all CameraWorker processes...");
+
+                var processes = System.Diagnostics.Process.GetProcessesByName("CameraWorker");
+                foreach (var process in processes)
+                {
+                    try
+                    {
+                        FileLogger.Log($"?? Force killing CameraWorker process ID: {process.Id}");
+                        process.Kill();
+                        process.WaitForExit(1000);
+                        process.Dispose();
+                    }
+                    catch (Exception ex)
+                    {
+                        FileLogger.LogException(ex, $"ForceKill process {process.Id}");
+                    }
+                }
+
+                FileLogger.Log("? Force kill completed");
+            }
+            catch (Exception ex)
+            {
+                FileLogger.LogException(ex, "ForceKillAllCameraWorkers");
+            }
+        }
+
+        public void ReloadCameraList()
+        {
+            try
+            {
+                Console.WriteLine("?? Reloading camera list from database...");
+                LoadCameraList();
+
+                if (this.InvokeRequired)
+                {
+                    this.Invoke(new Action(() => LayoutCameraSpreadView()));
+                }
+                else
+                {
+                    LayoutCameraSpreadView();
+                }
+
+                Console.WriteLine("? Camera list reloaded successfully");
+                FileLogger.Log($"Camera list reloaded: {NumCameras} cameras found");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"? Error reloading camera list: {ex.Message}");
+                FileLogger.LogException(ex, "ReloadCameraList");
+            }
+        }
+
+        public void UpdateCameraLogInvoke(System.Windows.Forms.Control control)
+        {
+            if (control.InvokeRequired)
+            {
+                control.Invoke(new MethodInvoker(delegate
+                {
+                    UpdateCameraLog();
+                }));
+            }
+            else
+            {
+                UpdateCameraLog();
+            }
+        }
+
+        public void UpdateCameraLog()
+        {
+            try
+            {
+                connection.Open();
+                string query = "SELECT Camera, Time, Event FROM camera_log ORDER BY STT DESC";
+                MySqlDataAdapter dataAdapter = new MySqlDataAdapter(query, connection);
+                DataTable dataTable = new DataTable();
+                dataAdapter.Fill(dataTable);
+                dgviewLog.DataSource = dataTable;
+                ClassSystemConfig.Ins.m_ClsFunc.FormatDataGridView(dgviewLog);
+
+                dgviewLog.Columns["Camera"].HeaderText = "Camera";
+                dgviewLog.Columns["Camera"].DefaultCellStyle.Alignment = DataGridViewContentAlignment.MiddleCenter;
+                dgviewLog.Columns["Camera"].Width = 80;
+                dgviewLog.Columns["Time"].HeaderText = "Time";
+                dgviewLog.Columns["Time"].AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill;
+                dgviewLog.Columns["Event"].HeaderText = "Event";
+                dgviewLog.Columns["Event"].DefaultCellStyle.Alignment = DataGridViewContentAlignment.MiddleCenter;
+                dgviewLog.Columns["Event"].Width = 80;
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show("L?i k?t n?i: " + ex.Message);
+            }
+            finally
+            {
+                connection.Close();
+            }
+        }
+
+        // Process exit handlers
+        private void CurrentDomain_ProcessExit(object sender, EventArgs e)
+        {
+            FileLogger.Log("?? ProcessExit event triggered - Emergency cleanup");
+            EmergencyShutdown();
+        }
+
+        private void CurrentDomain_UnhandledException(object sender, UnhandledExceptionEventArgs e)
+        {
+            FileLogger.LogException((Exception)e.ExceptionObject, "UnhandledException");
+            FileLogger.Log("?? Unhandled exception - Emergency cleanup");
+            EmergencyShutdown();
+        }
+
+        private void Application_ApplicationExit(object sender, EventArgs e)
+        {
+            FileLogger.Log("?? ApplicationExit event triggered - Emergency cleanup");
+            EmergencyShutdown();
+        }
+
+        private void SystemEvents_SessionEnding(object sender, Microsoft.Win32.SessionEndingEventArgs e)
+        {
+            FileLogger.Log($"?? Windows session ending: {e.Reason} - Emergency cleanup");
+            EmergencyShutdown();
+        }
+
+        // Camera system methods
+        private void StartCameraSystem()
+        {
+            try
+            {
+                string cameraWorkerPath = Path.Combine(Environment.CurrentDirectory, "CameraWorker.exe");
+                if (!File.Exists(cameraWorkerPath))
+                {
+                    string errorMsg = $"? CameraWorker.exe not found at: {cameraWorkerPath}";
+                    FileLogger.Log(errorMsg);
+                    Console.WriteLine(errorMsg);
+                    return;
+                }
+
+                if (ClassSystemConfig.Ins.m_ClsCommon.m_ListRtspCam.Count == 0)
+                {
+                    LoadCameraList();
+                }
+
+                int actualCameraCount = ClassSystemConfig.Ins.m_ClsCommon.m_ListRtspCam.Count;
+                FileLogger.Log($"?? Starting {actualCameraCount} camera workers");
+
+                for (int i = 0; i < actualCameraCount; i++)
+                {
+                    string rtspUrl = ClassSystemConfig.Ins.m_ClsCommon.m_ListRtspCam[i];
+                    string mmfName = $"Cam_{i}_MMF";
+                    string mutexName = $"Global\\Cam_{i}_Mutex";
+
+                    try
+                    {
+                        var mmf = MemoryMappedFile.CreateOrOpen(mmfName, MaxFrameSize, MemoryMappedFileAccess.ReadWrite);
+                        _mmfs.Add(mmf);
+
+                        using (var accessor = mmf.CreateViewAccessor())
+                        {
+                            accessor.Write(0, 0);
+                            accessor.Write(4, 0);
+                        }
+
+                        _mutexes.Add(new Mutex(false, mutexName));
+
+                        string arguments = $"\"{rtspUrl}\" {mmfName} {mutexName}";
+                        var supervisor = new ProcessSupervisor(
+                            loggerFactory: NullLoggerFactory.Instance,
+                            processRunType: ProcessRunType.NonTerminating,
+                            processPath: cameraWorkerPath,
+                            arguments: arguments,
+                            workingDirectory: Environment.CurrentDirectory
+                        );
+
+                        _supervisors.Add(supervisor);
+                        supervisor.Start();
+
+                        FileLogger.Log($"?? Camera {i + 1} worker started");
+                        Thread.Sleep(200);
+                    }
+                    catch (Exception ex)
+                    {
+                        FileLogger.LogException(ex, $"StartCameraSystem - Camera {i + 1}");
+                        continue;
+                    }
+                }
+
+                DisplayTimer.Interval = 5;
+                DisplayTimer.Start();
+
+                FileLogger.Log($"? Camera system started with {_supervisors.Count}/{actualCameraCount} workers");
+            }
+            catch (Exception ex)
+            {
+                FileLogger.LogException(ex, "StartCameraSystem");
+            }
+        }
+
+        private void UpdatePictureBox(int index)
+        {
+            if (_isShuttingDown || index >= _pictureboxes.Count) return;
+
+            try
+            {
+                var mutex = _mutexes[index];
+                var mmf = _mmfs[index];
+                var pictureBox = _pictureboxes[index];
+
+                if (mutex?.WaitOne(0) == true)
+                {
+                    try
+                    {
+                        using (var accessor = mmf.CreateViewAccessor())
+                        {
+                            int width = accessor.ReadInt32(0);
+                            int height = accessor.ReadInt32(4);
+
+                            if (width > 0 && height > 0 && width <= MaxFrameWidth && height <= MaxFrameHeight)
+                            {
+                                long frameSize = (long)width * height * 3;
+                                byte[] frameData = new byte[frameSize];
+                                accessor.ReadArray(8, frameData, 0, frameData.Length);
+
+                                bool hasData = false;
+                                for (int i = 0; i < Math.Min(1000, frameData.Length); i++)
+                                {
+                                    if (frameData[i] != 0)
+                                    {
+                                        hasData = true;
+                                        break;
+                                    }
+                                }
+
+                                if (hasData)
+                                {
+                                    var bmp = new Bitmap(width, height, PixelFormat.Format24bppRgb);
+                                    BitmapData bmpData = bmp.LockBits(new Rectangle(0, 0, width, height),
+                                        ImageLockMode.WriteOnly, PixelFormat.Format24bppRgb);
+
+                                    try
+                                    {
+                                        int stride = bmpData.Stride;
+                                        IntPtr scan0 = bmpData.Scan0;
+                                        int srcLineSize = width * 3;
+
+                                        for (int y = 0; y < height; y++)
+                                        {
+                                            int srcOffset = y * srcLineSize;
+                                            IntPtr dstLineStart = scan0 + (y * stride);
+                                            Marshal.Copy(frameData, srcOffset, dstLineStart, Math.Min(srcLineSize, stride));
+                                        }
+                                    }
+                                    finally
+                                    {
+                                        bmp.UnlockBits(bmpData);
+                                    }
+
+                                    if (!_isShuttingDown && !pictureBox.IsDisposed)
+                                    {
+                                        if (pictureBox.Controls.Count > 0)
+                                        {
+                                            pictureBox.Controls[0].Visible = false;
+                                        }
+
+                                        var oldImage = pictureBox.Image;
+                                        pictureBox.Image = bmp;
+                                        oldImage?.Dispose();
+
+                                        // 👉 Thêm đoạn này để DetectionTimer có dữ liệu
+                                        lock (_frameStoreLock)
+                                        {
+                                            if (_latestFrames.ContainsKey(index))
+                                            {
+                                                _latestFrames[index]?.Dispose();
+                                                _latestFrames[index] = (Bitmap)bmp.Clone();
+                                            }
+                                            else
+                                            {
+                                                _latestFrames.Add(index, (Bitmap)bmp.Clone());
+                                            }
+                                        }
+
+                                        pictureBox.Invalidate();
+                                    }
+                                    else
+                                    {
+                                        bmp.Dispose();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    finally
+                    {
+                        mutex.ReleaseMutex();
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                if (!_isShuttingDown)
+                {
+                    FileLogger.LogException(ex, $"updating picture box {index}");
+                }
+            }
+        }
+
+        #endregion
+
+        private void btnAlarm_Click(object sender, EventArgs e)
+        {
+            ChangeButtonColorClick(sender);
+            if (ClassSystemConfig.Ins.m_FrmConfigMessage == null || ClassSystemConfig.Ins.m_FrmConfigMessage.IsDisposed)
+            {
+                ClassSystemConfig.Ins.m_FrmConfigMessage = new FormConfigMessage();
+            }
+            ClassSystemConfig.Ins.m_FrmConfigMessage.Show();
+            ClassSystemConfig.Ins.m_ClsFunc.SaveLog(ClassFunction.SAVING_LOG_TYPE.HANDLER_CLICKED,
+                                                    "Clicked Config Message View",
+                                                    ClassSystemConfig.Ins.m_ClsCommon.IsSaveLog_Local, true);
+        }
+
+        private void btnLogView_Click(object sender, EventArgs e)
+        {
+            ChangeButtonColorClick(sender);
+            ClassSystemConfig.Ins.m_FrmLogView.Show();
+            ClassSystemConfig.Ins.m_FrmLogView.ShowOnScreen();
+            ClassSystemConfig.Ins.m_ClsFunc.SaveLog(ClassFunction.SAVING_LOG_TYPE.HANDLER_CLICKED,
+                                                    "Clicked Log View",
+                                                    ClassSystemConfig.Ins.m_ClsCommon.IsSaveLog_Local, true);
+        }
+    }
+}
