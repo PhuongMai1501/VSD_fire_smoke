@@ -280,13 +280,7 @@ namespace CameraManager
                     e.Handled = true;
                 }
 
-                // Test detection overlay
-                else if (e.KeyCode == Keys.T)
-                {
-                    FileLogger.Log("?? Testing detection overlay with fake detections");
-                    TestDetectionOverlay();
-                    e.Handled = true;
-                }
+                // (Removed) Test detection overlay via T key
 
                 // Emergency shutdown with Ctrl+Alt+X
                 else if (e.Control && e.Alt && e.KeyCode == Keys.X)
@@ -940,16 +934,6 @@ namespace CameraManager
             {
                 if (graphics == null || detections == null) return;
 
-                // Draw quick debug info: number of detections
-                try
-                {
-                    using var dbgFont = new Font("Arial", 9, FontStyle.Bold);
-                    using var dbgBrush = new SolidBrush(Color.Red);
-                    graphics.DrawString($"{detections.Count} dets", dbgFont, dbgBrush, 8, 8);
-                }
-                catch { }
-
-                int idx = 0;
                 foreach (var detection in detections)
                 {
                     if (detection.score < 0.3) continue;
@@ -971,12 +955,7 @@ namespace CameraManager
                     int w = Math.Max(1, right - left);
                     int h = Math.Max(1, bottom - top);
 
-                    if (idx == 0)
-                    {
-                        FileLogger.Log($"Draw cam overlay: img=({imageWidth}x{imageHeight}) rect=({left},{top},{w},{h})");
-                    }
-
-                    using (var pen = new Pen(Color.Lime, 2))
+                    using (var pen = new Pen(Color.Red, 2))
                     {
                         Rectangle rect = new Rectangle(left, top, w, h);
                         graphics.DrawRectangle(pen, rect);
@@ -990,7 +969,6 @@ namespace CameraManager
                             graphics.DrawString(labelText, font, textBrush, new PointF(left + 3, Math.Max(0, top - 18)));
                         }
                     }
-                    idx++;
                 }
             }
             catch (Exception ex)
@@ -1040,11 +1018,14 @@ namespace CameraManager
                     {
                         var labels = detections
                             .Where(d => d != null && !string.IsNullOrWhiteSpace(d.label))
-                            .Select(d => d.label)
+                            .Select(d => d.label?.Trim() ?? "")
                             .ToList();
-                        string eventText = labels.Count > 0
-                            ? $"DETECTION: {string.Join(",", labels)}"
-                            : "DETECTION";
+
+                        // Map labels to only FIRE or SMOKE
+                        bool hasFire = labels.Any(l => l.Equals("fire", StringComparison.OrdinalIgnoreCase) || l.Equals("flame", StringComparison.OrdinalIgnoreCase) || l.Contains("fire", StringComparison.OrdinalIgnoreCase) || l.Contains("flame", StringComparison.OrdinalIgnoreCase));
+                        bool hasSmoke = labels.Any(l => l.Equals("smoke", StringComparison.OrdinalIgnoreCase) || l.Contains("smoke", StringComparison.OrdinalIgnoreCase));
+                        string eventText = hasFire ? "FIRE" : (hasSmoke ? "SMOKE" : "FIRE");
+
                         AddCameraLogData(cameraIndex + 1, DateTime.Now, eventText, filePath);
 
                         // Tự động refresh bảng log sau khi có detection mới
@@ -1080,9 +1061,10 @@ namespace CameraManager
                     string sql = "INSERT INTO camera_log (`Camera`, `Time`, `Event`, `image_Path`) VALUES (@cam, @time, @event, @path)";
                     using (var cmd = new MySql.Data.MySqlClient.MySqlCommand(sql, conn))
                     {
-                        cmd.Parameters.AddWithValue("@cam", cameraNumber);
+                        string camName = $"CAM{cameraNumber}";
+                        cmd.Parameters.AddWithValue("@cam", camName);
                         cmd.Parameters.AddWithValue("@time", time);
-                        cmd.Parameters.AddWithValue("@event", eventText ?? "DETECTION");
+                        cmd.Parameters.AddWithValue("@event", string.IsNullOrWhiteSpace(eventText) ? "FIRE" : eventText);
                         cmd.Parameters.AddWithValue("@path", imagePath ?? string.Empty);
                         cmd.ExecuteNonQuery();
                     }
@@ -1190,37 +1172,7 @@ namespace CameraManager
             return ms.ToArray();
         }
 
-        private void TestDetectionOverlay()
-        {
-            try
-            {
-                var testDetections = new List<Detection>
-                {
-                    new Detection
-                    {
-                        label = "TEST_PERSON",
-                        x1 = 0.2, y1 = 0.3, x2 = 0.5, y2 = 0.7,
-                        score = 0.95
-                    }
-                };
-
-                lock (_cameraDetections)
-                {
-                    if (_cameraDetections.Count == 0)
-                    {
-                        _cameraDetections.Add(new List<Detection>());
-                    }
-                    _cameraDetections[0].Clear();
-                    _cameraDetections[0].AddRange(testDetections);
-                }
-
-                TriggerPaintEvent(0, testDetections.Count);
-            }
-            catch (Exception ex)
-            {
-                FileLogger.LogException(ex, "TestDetectionOverlay");
-            }
-        }
+        // TestDetectionOverlay removed per request
 
         #endregion
 
@@ -1819,7 +1771,7 @@ namespace CameraManager
 • Ctrl+Shift+K: Force kill camera workers
 • Ctrl+E: Force exit fullscreen (emergency)
 • H: Show this help
-• T: Test detection overlay
+
 
 ?? OPTIMIZED FEATURES:
 • Smart camera switching - no need to exit first
