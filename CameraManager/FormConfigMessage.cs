@@ -1,16 +1,17 @@
-﻿using System;
+﻿using Discord;
+using Discord.WebSocket;
+using MySql.Data.MySqlClient;
+using System;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.Data;
 using System.Drawing;
+using System.IO;
 using System.Linq;
+using System.Net.Http;
 using System.Text;
 using System.Threading.Tasks;
 using System.Windows.Forms;
-using System.Net.Http;
-using Discord;
-using Discord.WebSocket;
-using System.IO;
 
 namespace CameraManager
 {
@@ -20,7 +21,6 @@ namespace CameraManager
         private bool _discordReady = false;
         private string _discordBotToken = "MTM5NzQyNjg5NTQ1MjI0NjAxNg.GB8PVN.Q7exGNICXiQlx2-wQxW0-qKr0y7lzoKCsYYtz4";
         private ulong _discordChannelId = 653602857060401207; // Replace with your channel ID
-        private System.Windows.Forms.CheckBox chkEnableAlert;
 
         public FormConfigMessage()
         {
@@ -143,9 +143,9 @@ namespace CameraManager
         {
             LoadDeviceConfig(false);
             InitComboBoxes();
-
+            UpdateAlarmMes();
         }
-
+        #region Config Message
         private async void btnTest_Click(object sender, EventArgs e)
         {
             string selectedApp = cmbAppSelect.SelectedItem?.ToString();
@@ -169,15 +169,98 @@ namespace CameraManager
 
         private async Task SendTelegramMessageAsync(string message)
         {
-            // Thay YOUR_BOT_TOKEN và YOUR_CHAT_ID bằng thông tin thực tế
-            string botToken = "7918989769:AAEAH2IAU91rJ3pBGGGLhuE2SDm03Q4-TH4";
-            string chatId = "8178161299";
-            string url = $"https://api.telegram.org/bot{botToken}/sendMessage?chat_id={chatId}&text={Uri.EscapeDataString(message)}";
-
-
-            using (HttpClient client = new HttpClient())
+            try
             {
-                await client.GetAsync(url);
+                if (string.IsNullOrWhiteSpace(message)) return;
+
+                string botToken = "7918989769:AAEAH2IAU91rJ3pBGGGLhuE2SDm03Q4-TH4";
+                // Lấy danh sách người nhận: Name, SDT, ChatID (có thể nhiều ID trong 1 ô)
+                var recipients = new List<(string Name, string SDT, string ChatID)>();
+                string connStr = ClassSystemConfig.Ins?.m_ClsCommon?.connectionString;
+                if (string.IsNullOrWhiteSpace(connStr))
+                {
+                    FileLogger.Log("SendTelegramMessageAsync: Missing DB connection string");
+                    return;
+                }
+
+                using (var conn = new MySqlConnection(connStr))
+                {
+                    await conn.OpenAsync();
+                    string sql = "SELECT Name, SDT, ChatID FROM alarm_mes WHERE IsActive = 1 AND ChatID IS NOT NULL AND TRIM(ChatID) <> ''";
+                    using (var cmd = new MySqlCommand(sql, conn))
+                    using (var reader = await cmd.ExecuteReaderAsync())
+                    {
+                        while (await reader.ReadAsync())
+                        {
+                            var name = reader["Name"]?.ToString()?.Trim() ?? string.Empty;
+                            var sdt = reader["SDT"]?.ToString()?.Trim() ?? string.Empty;
+                            var raw = reader["ChatID"]?.ToString()?.Trim();
+                            if (string.IsNullOrWhiteSpace(raw)) continue;
+
+                            // Hỗ trợ nhiều ChatID trong một ô, phân tách bằng , ; khoảng trắng
+                            var parts = raw
+                                .Split(new[] { ',', ';', ' ', '\t', '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries)
+                                .Select(s => s.Trim())
+                                .Where(s => !string.IsNullOrWhiteSpace(s));
+                            foreach (var id in parts)
+                            {
+                                recipients.Add((name, sdt, id));
+                            }
+                        }
+                    }
+                }
+
+                if (recipients.Count == 0)
+                {
+                    FileLogger.Log("SendTelegramMessageAsync: No ChatID found in alarm_mes");
+                    return;
+                }
+
+                // Loại bỏ trùng lặp theo ChatID + Name + SDT để giữ tương ứng đúng
+                recipients = recipients
+                    .GroupBy(r => (r.ChatID, r.Name, r.SDT))
+                    .Select(g => g.First())
+                    .ToList();
+
+                using (HttpClient client = new HttpClient())
+                {
+                    foreach (var r in recipients)
+                    {
+                        try
+                        {
+                            // Valid sơ bộ chatID (không chặn username @), chỉ để loại bỏ giá trị vô lý
+                            if (string.IsNullOrWhiteSpace(r.ChatID))
+                            {
+                                ClassSystemConfig.Ins.m_ClsFunc.SaveLog(ClassFunction.SAVING_LOG_TYPE.DATA,
+                                    $"TELEGRAM SEND | Name={r.Name} | ChatID=<EMPTY> | SDT={r.SDT} | Status=FAIL (empty)",
+                                    ClassSystemConfig.Ins.m_ClsCommon.IsSaveLog_Local, true);
+                                continue;
+                            }
+
+                            string url = $"https://api.telegram.org/bot{botToken}/sendMessage?chat_id={r.ChatID}&text={Uri.EscapeDataString(message)}";
+                            var resp = await client.GetAsync(url);
+                            var ok = resp.IsSuccessStatusCode;
+
+                            // Nếu server trả mã lỗi (ví dụ 400 cho chat_id sai), coi như FAIL nhưng không văng lỗi
+                            ClassSystemConfig.Ins.m_ClsFunc.SaveLog(ClassFunction.SAVING_LOG_TYPE.DATA,
+                                $"TELEGRAM SEND | Name={r.Name} | ChatID={r.ChatID} | SDT={r.SDT} | Status={(ok ? "SUCCESS" : "FAIL (HTTP)")}",
+                                ClassSystemConfig.Ins.m_ClsCommon.IsSaveLog_Local, true);
+                            FileLogger.Log($"Telegram sent to ChatID={r.ChatID} => {(ok ? "OK" : "HTTP_FAIL")}\n");
+                        }
+                        catch (Exception exSend)
+                        {
+                            // Ghi log thất bại, nhưng không làm crash chương trình
+                            ClassSystemConfig.Ins.m_ClsFunc.SaveLog(ClassFunction.SAVING_LOG_TYPE.DATA,
+                                $"TELEGRAM SEND | Name={r.Name} | ChatID={r.ChatID} | SDT={r.SDT} | Status=FAIL (EXCEPTION: {exSend.Message})",
+                                ClassSystemConfig.Ins.m_ClsCommon.IsSaveLog_Local, true);
+                            FileLogger.LogException(exSend, $"SendTelegramMessageAsync -> ChatID={r.ChatID}");
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                FileLogger.LogException(ex, "SendTelegramMessageAsync");
             }
         }
 
@@ -218,5 +301,230 @@ namespace CameraManager
                 Console.WriteLine("Không tìm thấy channel!");
             }
         }
+        #endregion
+
+        #region DataGridView Events
+        public void UpdateAlarmMes()
+        {
+            using (MySqlConnection connectionMes = new MySqlConnection(ClassSystemConfig.Ins.m_ClsCommon.connectionString))
+            {
+                try
+                {
+                    connectionMes.Open();
+                    string query = "SELECT ID, Name, SDT, IsActive, ChatID FROM alarm_mes ORDER BY ID DESC";
+                    MySqlDataAdapter dataAdapter = new MySqlDataAdapter(query, connectionMes);
+                    DataTable dataTable = new DataTable();
+                    dataAdapter.Fill(dataTable);
+                    dgMessage_Alarm.DataSource = dataTable;
+
+                    // Format DataGridView nếu bạn có hàm riêng
+                    ClassSystemConfig.Ins.m_ClsFunc.FormatDataGridView(dgMessage_Alarm);
+
+                    // Thiết lập tiêu đề và căn chỉnh cột
+                    dgMessage_Alarm.Columns["ID"].HeaderText = "STT";
+                    dgMessage_Alarm.Columns["ID"].DefaultCellStyle.Alignment = DataGridViewContentAlignment.MiddleCenter;
+                    dgMessage_Alarm.Columns["ID"].Width = 30;
+
+                    dgMessage_Alarm.Columns["Name"].HeaderText = "Name";
+                    dgMessage_Alarm.Columns["Name"].DefaultCellStyle.Alignment = DataGridViewContentAlignment.MiddleCenter;
+                    dgMessage_Alarm.Columns["Name"].Width = 100;
+
+                    dgMessage_Alarm.Columns["SDT"].HeaderText = "Phone number";
+                    dgMessage_Alarm.Columns["SDT"].AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill;
+                    dgMessage_Alarm.Columns["SDT"].DefaultCellStyle.Alignment = DataGridViewContentAlignment.MiddleCenter;
+
+                    dgMessage_Alarm.Columns["ChatID"].HeaderText = "ChatID";
+                    dgMessage_Alarm.Columns["ChatID"].DefaultCellStyle.Alignment = DataGridViewContentAlignment.MiddleCenter;
+                    dgMessage_Alarm.Columns["ChatID"].Width = 150;
+
+                    dgMessage_Alarm.Columns["IsActive"].Visible = false;
+
+                }
+                catch (Exception ex)
+                {
+                    MessageBox.Show("Lỗi kết nối: " + ex.Message);
+                }
+                finally
+                {
+                    connectionMes.Close();
+                }
+            }
+        }
+
+        public void DeleteAlarmMes(int id)
+        {
+            using (MySqlConnection connectionMes = new MySqlConnection(ClassSystemConfig.Ins.m_ClsCommon.connectionString))
+            {
+                try
+                {
+                    connectionMes.Open();
+                    string query = "DELETE FROM alarm_mes WHERE ID = @ID";
+
+                    using (MySqlCommand cmd = new MySqlCommand(query, connectionMes))
+                    {
+                        cmd.Parameters.AddWithValue("@ID", id);
+
+                        int rowsAffected = cmd.ExecuteNonQuery();
+                        if (rowsAffected > 0)
+                        {
+                            MessageBox.Show("Xóa dữ liệu thành công!");
+                            UpdateAlarmMes(); // Refresh DataGridView sau khi xóa
+                        }
+                        else
+                        {
+                            MessageBox.Show("Không tìm thấy dữ liệu để xóa.");
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    MessageBox.Show("Lỗi khi xóa dữ liệu: " + ex.Message);
+                }
+            }
+        }
+
+        private void dgMessage_Alarm_SelectionChanged(object sender, EventArgs e)
+        {
+            if (dgMessage_Alarm.CurrentRow == null)
+                return;
+            int iSelected = dgMessage_Alarm.CurrentRow.Index;
+
+            if (iSelected >= 0 && iSelected < dgMessage_Alarm.Rows.Count)
+            {
+                txbName.Text = dgMessage_Alarm.Rows[iSelected].Cells[1].Value.ToString();
+                txbPhone_num.Text = dgMessage_Alarm.Rows[iSelected].Cells[2].Value.ToString();
+                txbChatID.Text = dgMessage_Alarm.Rows[iSelected].Cells["ChatID"].Value?.ToString() ?? string.Empty;
+                // Lấy trạng thái IsActive từ DataGridView
+                var cellValue = dgMessage_Alarm.Rows[iSelected].Cells["IsActive"].Value;
+                if (cellValue != null && cellValue != DBNull.Value)
+                {
+                    chkEnableAlert.Checked = Convert.ToInt32(cellValue) == 1;
+                }
+                else
+                {
+                    chkEnableAlert.Checked = false;
+                }
+            }
+
+        }
+
+        public void UpdateCameraData(string name, string phone_number, int stt, bool isActive, string chatId = null)
+        {
+            MySqlConnection connection = new MySqlConnection(ClassSystemConfig.Ins.m_ClsCommon.connectionString);
+
+            try
+            {
+                connection.Open();
+                string query = "UPDATE alarm_mes SET Name = @Name, SDT = @SDT, IsActive = @IsActive, ChatID = @ChatID WHERE ID = @ID";
+
+                using (MySqlCommand command = new MySqlCommand(query, connection))
+                {
+                    // Thêm tham số vào câu lệnh
+                    command.Parameters.AddWithValue("@Name", name);
+                    command.Parameters.AddWithValue("@SDT", phone_number);
+                    command.Parameters.AddWithValue("@IsActive", isActive ? 1 : 0);
+                    command.Parameters.AddWithValue("@ChatID", string.IsNullOrEmpty(chatId) ? (object)DBNull.Value : chatId);
+                    command.Parameters.AddWithValue("@ID", stt);
+
+                    int rowsAffected = command.ExecuteNonQuery();
+                    if (rowsAffected > 0)
+                    {
+                        UpdateAlarmMes();
+                        MessageBox.Show("Dữ liệu đã được cập nhật thành công!");
+                    }
+                    else
+                    {
+                        MessageBox.Show("Không có dữ liệu được cập nhật.");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show("Lỗi: " + ex.Message);
+            }
+            finally
+            {
+                connection.Close();
+            }
+        }
+
+        public void InsertAlarmMes(string name, string phoneNumber, bool isActive, string chatId = null)
+        {
+            using (MySqlConnection connectionMes = new MySqlConnection(ClassSystemConfig.Ins.m_ClsCommon.connectionString))
+            {
+                try
+                {
+                    connectionMes.Open();
+                    string query = "INSERT INTO alarm_mes (Name, SDT, IsActive, ChatID) VALUES (@Name, @SDT, @IsActive, @ChatID)";
+
+
+                    using (MySqlCommand cmd = new MySqlCommand(query, connectionMes))
+                    {
+                        cmd.Parameters.AddWithValue("@Name", name);
+                        cmd.Parameters.AddWithValue("@SDT", phoneNumber);
+                        cmd.Parameters.AddWithValue("@IsActive", isActive ? 1 : 0);
+                        cmd.Parameters.AddWithValue("@ChatID", string.IsNullOrEmpty(chatId) ? (object)DBNull.Value : chatId);
+
+                        int rowsAffected = cmd.ExecuteNonQuery();
+                        if (rowsAffected > 0)
+                        {
+                            MessageBox.Show("Thêm mới dữ liệu thành công!");
+                            UpdateAlarmMes(); // Refresh DataGridView sau khi thêm
+                        }
+                        else
+                        {
+                            MessageBox.Show("Không có dữ liệu nào được thêm.");
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    MessageBox.Show("Lỗi khi thêm dữ liệu: " + ex.Message);
+                }
+            }
+        }
+
+        private void btnUpdate_Mes_Click(object sender, EventArgs e)
+        {
+            string name = txbName.Text.Trim();
+            string phone_number = txbPhone_num.Text.Trim();
+            bool IsActive = chkEnableAlert.Checked;
+            string chatId = txbChatID.Text.Trim(); // Hoặc lấy từ một TextBox nếu cần
+            UpdateCameraData(name, phone_number, Convert.ToInt32(dgMessage_Alarm.CurrentRow.Cells[0].Value.ToString()), IsActive, chatId);
+        }
+
+        private void btnAdd_Mes_Click(object sender, EventArgs e)
+        {
+            string name = txbName.Text.Trim();
+            string phone_number = txbPhone_num.Text.Trim();
+            bool IsActive = chkEnableAlert.Checked;
+            string chatId = txbChatID.Text.Trim(); // Hoặc lấy từ một TextBox nếu cần
+
+            InsertAlarmMes(name, phone_number, IsActive, chatId);
+        }
+
+        private void btnDelete_Mes_Click(object sender, EventArgs e)
+        {
+            if (dgMessage_Alarm.CurrentRow == null)
+            {
+                MessageBox.Show("Vui lòng chọn dòng cần xóa!");
+                return;
+            }
+
+            int id = Convert.ToInt32(dgMessage_Alarm.CurrentRow.Cells["ID"].Value);
+
+            DialogResult result = MessageBox.Show(
+                "Bạn có chắc chắn muốn xóa dòng này?",
+                "Xác nhận xóa",
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Warning
+            );
+
+            if (result == DialogResult.Yes)
+            {
+                DeleteAlarmMes(id);
+            }
+        }
+        #endregion
     }
 }
