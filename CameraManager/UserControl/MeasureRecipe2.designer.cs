@@ -49,6 +49,7 @@
             label1 = new Label();
             panel2 = new Panel();
             panelMain = new Panel();
+            pictureBox1 = new PictureBox();
             toolStrip1 = new ToolStrip();
             toolStripRunImage = new ToolStripButton();
             toolStripSeparator1 = new ToolStripSeparator();
@@ -80,6 +81,8 @@
             ((System.ComponentModel.ISupportInitialize)numFlame_Sen).BeginInit();
             ((System.ComponentModel.ISupportInitialize)numInterval).BeginInit();
             panel2.SuspendLayout();
+            panelMain.SuspendLayout();
+            ((System.ComponentModel.ISupportInitialize)pictureBox1).BeginInit();
             toolStrip1.SuspendLayout();
             SuspendLayout();
             // 
@@ -145,6 +148,7 @@
             dgviewCamera.SelectionMode = DataGridViewSelectionMode.FullRowSelect;
             dgviewCamera.Size = new Size(286, 737);
             dgviewCamera.TabIndex = 1;
+            dgviewCamera.SelectionChanged += dgviewCamera_SelectionChanged;
             // 
             // panel4
             // 
@@ -334,11 +338,22 @@
             // 
             // panelMain
             // 
+            panelMain.Controls.Add(pictureBox1);
             panelMain.Dock = DockStyle.Fill;
             panelMain.Location = new Point(0, 35);
             panelMain.Name = "panelMain";
             panelMain.Size = new Size(504, 782);
             panelMain.TabIndex = 11;
+            // 
+            // pictureBox1
+            // 
+            pictureBox1.BorderStyle = BorderStyle.FixedSingle;
+            pictureBox1.Dock = DockStyle.Fill;
+            pictureBox1.Location = new Point(0, 0);
+            pictureBox1.Name = "pictureBox1";
+            pictureBox1.Size = new Size(504, 782);
+            pictureBox1.TabIndex = 0;
+            pictureBox1.TabStop = false;
             // 
             // toolStrip1
             // 
@@ -500,6 +515,8 @@
             ((System.ComponentModel.ISupportInitialize)numInterval).EndInit();
             panel2.ResumeLayout(false);
             panel2.PerformLayout();
+            panelMain.ResumeLayout(false);
+            ((System.ComponentModel.ISupportInitialize)pictureBox1).EndInit();
             toolStrip1.ResumeLayout(false);
             toolStrip1.PerformLayout();
             ResumeLayout(false);
@@ -554,5 +571,6 @@
         private System.Windows.Forms.NumericUpDown numColCam;
         private System.Windows.Forms.Label label4;
         private System.Windows.Forms.Label label5;
+        private PictureBox pictureBox1;
     }
 }

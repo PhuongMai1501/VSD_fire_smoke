@@ -814,6 +814,24 @@ namespace CameraManager
                 if (detections.Count > 0)
                 {
                     try { SaveDetectionImage(cameraIndex, frame, detections); } catch (Exception exSave) { FileLogger.LogException(exSave, "ProcessDetectionAsync -> SaveDetectionImage"); }
+
+                    // Gọi cảnh báo alarm nếu bật và có người nhận active
+                    try
+                    {
+                        var labels = detections
+                            .Where(d => d != null && !string.IsNullOrWhiteSpace(d.label))
+                            .Select(d => d.label?.Trim() ?? "")
+                            .ToList();
+                        bool hasFire = labels.Any(l => l.Equals("fire", StringComparison.OrdinalIgnoreCase) || l.Equals("flame", StringComparison.OrdinalIgnoreCase) || l.Contains("fire", StringComparison.OrdinalIgnoreCase) || l.Contains("flame", StringComparison.OrdinalIgnoreCase));
+                        bool hasSmoke = labels.Any(l => l.Equals("smoke", StringComparison.OrdinalIgnoreCase) || l.Contains("smoke", StringComparison.OrdinalIgnoreCase));
+                        string eventText = hasFire ? "FIRE" : (hasSmoke ? "SMOKE" : "FIRE");
+
+                        _ = SendAlarmToActiveRecipientsAsync(eventText);
+                    }
+                    catch (Exception exAlarm)
+                    {
+                        FileLogger.LogException(exAlarm, "ProcessDetectionAsync -> SendAlarm");
+                    }
                 }
 
                 TriggerPaintEvent(cameraIndex, detections.Count);
@@ -830,6 +848,98 @@ namespace CameraManager
                 {
                     _processsingDetection.Remove(cameraIndex);
                 }
+            }
+        }
+
+        // Gửi cảnh báo theo cấu hình (chỉ Telegram hiện tại) tới các ChatID đang IsActive=1
+        private async Task SendAlarmToActiveRecipientsAsync(string message)
+        {
+            try
+            {
+                if (string.IsNullOrWhiteSpace(message)) return;
+                // ByPass: nếu bật (1) thì bỏ qua không gửi
+                if (ClassSystemConfig.Ins?.m_ClsCommon?.b_ByPassAlarm == 1) return;
+
+                // 0: Telegram (theo form config)
+                if (ClassSystemConfig.Ins?.m_ClsCommon?.m_iFormatSendMessage != 0) return;
+
+                string botToken = "7918989769:AAEAH2IAU91rJ3pBGGGLhuE2SDm03Q4-TH4";
+                var recipients = new List<(string Name, string SDT, string ChatID)>();
+
+                string connStr = ClassSystemConfig.Ins?.m_ClsCommon?.connectionString;
+                if (string.IsNullOrWhiteSpace(connStr))
+                {
+                    FileLogger.Log("SendAlarmToActiveRecipientsAsync: Missing DB connection string");
+                    return;
+                }
+
+                using (var conn = new MySql.Data.MySqlClient.MySqlConnection(connStr))
+                {
+                    await conn.OpenAsync();
+                    string sql = "SELECT Name, SDT, ChatID FROM alarm_mes WHERE IsActive = 1 AND ChatID IS NOT NULL AND TRIM(ChatID) <> ''";
+                    using (var cmd = new MySql.Data.MySqlClient.MySqlCommand(sql, conn))
+                    using (var reader = await cmd.ExecuteReaderAsync())
+                    {
+                        while (await reader.ReadAsync())
+                        {
+                            var name = reader["Name"]?.ToString()?.Trim() ?? string.Empty;
+                            var sdt = reader["SDT"]?.ToString()?.Trim() ?? string.Empty;
+                            var raw = reader["ChatID"]?.ToString()?.Trim();
+                            if (string.IsNullOrWhiteSpace(raw)) continue;
+
+                            var parts = raw
+                                .Split(new[] { ',', ';', ' ', '\t', '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries)
+                                .Select(s => s.Trim())
+                                .Where(s => !string.IsNullOrWhiteSpace(s));
+                            foreach (var id in parts)
+                            {
+                                recipients.Add((name, sdt, id));
+                            }
+                        }
+                    }
+                }
+
+                if (recipients.Count == 0) return;
+                recipients = recipients
+                    .GroupBy(r => (r.ChatID, r.Name, r.SDT))
+                    .Select(g => g.First())
+                    .ToList();
+
+                using (var client = new HttpClient())
+                {
+                    foreach (var r in recipients)
+                    {
+                        try
+                        {
+                            if (string.IsNullOrWhiteSpace(r.ChatID))
+                            {
+                                ClassSystemConfig.Ins.m_ClsFunc.SaveLog(ClassFunction.SAVING_LOG_TYPE.DATA,
+                                    $"TELEGRAM SEND | Name={r.Name} | ChatID=<EMPTY> | SDT={r.SDT} | Status=FAIL (empty)",
+                                    ClassSystemConfig.Ins.m_ClsCommon.IsSaveLog_Local, true);
+                                continue;
+                            }
+
+                            string url = $"https://api.telegram.org/bot{botToken}/sendMessage?chat_id={r.ChatID}&text={Uri.EscapeDataString(message)}";
+                            var resp = await client.GetAsync(url);
+                            var ok = resp.IsSuccessStatusCode;
+
+                            ClassSystemConfig.Ins.m_ClsFunc.SaveLog(ClassFunction.SAVING_LOG_TYPE.DATA,
+                                $"TELEGRAM SEND | Name={r.Name} | ChatID={r.ChatID} | SDT={r.SDT} | Status={(ok ? "SUCCESS" : "FAIL (HTTP)")}",
+                                ClassSystemConfig.Ins.m_ClsCommon.IsSaveLog_Local, true);
+                        }
+                        catch (Exception exSend)
+                        {
+                            ClassSystemConfig.Ins.m_ClsFunc.SaveLog(ClassFunction.SAVING_LOG_TYPE.DATA,
+                                $"TELEGRAM SEND | Name={r.Name} | ChatID={r.ChatID} | SDT={r.SDT} | Status=FAIL (EXCEPTION: {exSend.Message})",
+                                ClassSystemConfig.Ins.m_ClsCommon.IsSaveLog_Local, true);
+                            FileLogger.LogException(exSend, $"SendAlarmToActiveRecipientsAsync -> ChatID={r.ChatID}");
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                FileLogger.LogException(ex, "SendAlarmToActiveRecipientsAsync");
             }
         }
 

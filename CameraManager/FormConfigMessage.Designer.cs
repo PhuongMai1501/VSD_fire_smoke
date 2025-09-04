@@ -38,16 +38,19 @@
             panel4 = new Panel();
             tableLayoutPanel3 = new TableLayoutPanel();
             panel5 = new Panel();
+            btnSave = new Button();
+            chkByPass = new CheckBox();
             btnTest = new Button();
             lblSubtitle = new Label();
             gbSendingMode = new GroupBox();
             chkEnableAlert = new CheckBox();
-            btnSave = new Button();
             lblAppSelect = new Label();
             cmbMessageSelect = new ComboBox();
             cmbAppSelect = new ComboBox();
             lblMessageSelect = new Label();
             panel6 = new Panel();
+            label4 = new Label();
+            txbChatID = new TextBox();
             btnDelete_Mes = new Button();
             btnAdd_Mes = new Button();
             btnUpdate_Mes = new Button();
@@ -56,8 +59,6 @@
             label2 = new Label();
             txbName = new TextBox();
             label1 = new Label();
-            label4 = new Label();
-            txbChatID = new TextBox();
             tableLayoutPanel1.SuspendLayout();
             panel1.SuspendLayout();
             panel2.SuspendLayout();
@@ -103,12 +104,12 @@
             lblTitle.Anchor = AnchorStyles.Left | AnchorStyles.Right;
             lblTitle.AutoSize = true;
             lblTitle.Font = new Font("Segoe UI", 18F, FontStyle.Bold, GraphicsUnit.Point, 0);
-            lblTitle.Location = new Point(179, 14);
+            lblTitle.Location = new Point(246, 14);
             lblTitle.Margin = new Padding(4, 0, 4, 0);
             lblTitle.Name = "lblTitle";
-            lblTitle.Size = new Size(254, 32);
+            lblTitle.Size = new Size(340, 32);
             lblTitle.TabIndex = 1;
-            lblTitle.Text = "Cài Đặt Gửi Tin Nhắn";
+            lblTitle.Text = "Setting Send Message Alarm";
             lblTitle.TextAlign = ContentAlignment.MiddleCenter;
             // 
             // panel2
@@ -190,10 +191,11 @@
             // panel5
             // 
             panel5.BorderStyle = BorderStyle.FixedSingle;
+            panel5.Controls.Add(btnSave);
+            panel5.Controls.Add(chkByPass);
             panel5.Controls.Add(btnTest);
             panel5.Controls.Add(lblSubtitle);
             panel5.Controls.Add(gbSendingMode);
-            panel5.Controls.Add(btnSave);
             panel5.Controls.Add(lblAppSelect);
             panel5.Controls.Add(cmbMessageSelect);
             panel5.Controls.Add(cmbAppSelect);
@@ -203,6 +205,41 @@
             panel5.Name = "panel5";
             panel5.Size = new Size(404, 221);
             panel5.TabIndex = 0;
+            // 
+            // btnSave
+            // 
+            btnSave.Anchor = AnchorStyles.Left;
+            btnSave.BackColor = Color.FromArgb(24, 119, 242);
+            btnSave.FlatAppearance.BorderSize = 0;
+            btnSave.FlatStyle = FlatStyle.Flat;
+            btnSave.Font = new Font("Segoe UI", 11F, FontStyle.Bold, GraphicsUnit.Point, 0);
+            btnSave.ForeColor = Color.White;
+            btnSave.Location = new Point(265, 160);
+            btnSave.Margin = new Padding(4, 3, 4, 3);
+            btnSave.Name = "btnSave";
+            btnSave.Size = new Size(117, 37);
+            btnSave.TabIndex = 30;
+            btnSave.Text = "Save";
+            btnSave.UseVisualStyleBackColor = false;
+            btnSave.Click += btnSave_Click;
+            // 
+            // chkByPass
+            // 
+            chkByPass.Appearance = Appearance.Button;
+            chkByPass.BackColor = Color.FromArgb(24, 119, 242);
+            chkByPass.Checked = true;
+            chkByPass.CheckState = CheckState.Checked;
+            chkByPass.Font = new Font("Segoe UI", 12F, FontStyle.Bold, GraphicsUnit.Point, 0);
+            chkByPass.ForeColor = SystemColors.ControlLightLight;
+            chkByPass.Location = new Point(265, 102);
+            chkByPass.Margin = new Padding(4, 3, 4, 3);
+            chkByPass.Name = "chkByPass";
+            chkByPass.Size = new Size(117, 46);
+            chkByPass.TabIndex = 1;
+            chkByPass.Text = "By Pass";
+            chkByPass.TextAlign = ContentAlignment.MiddleCenter;
+            chkByPass.UseVisualStyleBackColor = false;
+            chkByPass.CheckedChanged += chkByPass_CheckedChanged;
             // 
             // btnTest
             // 
@@ -229,9 +266,9 @@
             lblSubtitle.Location = new Point(69, 4);
             lblSubtitle.Margin = new Padding(4, 0, 4, 0);
             lblSubtitle.Name = "lblSubtitle";
-            lblSubtitle.Size = new Size(252, 15);
+            lblSubtitle.Size = new Size(246, 15);
             lblSubtitle.TabIndex = 22;
-            lblSubtitle.Text = "Thiết lập hệ thống cảnh báo và gửi tin tự động";
+            lblSubtitle.Text = "Set up automatic alert and messaging system";
             // 
             // gbSendingMode
             // 
@@ -241,10 +278,10 @@
             gbSendingMode.Margin = new Padding(4, 3, 4, 3);
             gbSendingMode.Name = "gbSendingMode";
             gbSendingMode.Padding = new Padding(4, 3, 4, 3);
-            gbSendingMode.Size = new Size(226, 46);
+            gbSendingMode.Size = new Size(250, 46);
             gbSendingMode.TabIndex = 23;
             gbSendingMode.TabStop = false;
-            gbSendingMode.Text = "Chế độ gửi tin nhắn";
+            gbSendingMode.Text = "Enable send message";
             // 
             // chkEnableAlert
             // 
@@ -254,26 +291,9 @@
             chkEnableAlert.Location = new Point(9, 22);
             chkEnableAlert.Margin = new Padding(4, 3, 4, 3);
             chkEnableAlert.Name = "chkEnableAlert";
-            chkEnableAlert.Size = new Size(183, 19);
+            chkEnableAlert.Size = new Size(229, 19);
             chkEnableAlert.TabIndex = 0;
-            chkEnableAlert.Text = "Bật/Tắt gửi cảnh báo tin nhắn";
-            // 
-            // btnSave
-            // 
-            btnSave.Anchor = AnchorStyles.Left;
-            btnSave.BackColor = Color.FromArgb(24, 119, 242);
-            btnSave.FlatAppearance.BorderSize = 0;
-            btnSave.FlatStyle = FlatStyle.Flat;
-            btnSave.Font = new Font("Segoe UI", 11F, FontStyle.Bold, GraphicsUnit.Point, 0);
-            btnSave.ForeColor = Color.White;
-            btnSave.Location = new Point(265, 117);
-            btnSave.Margin = new Padding(4, 3, 4, 3);
-            btnSave.Name = "btnSave";
-            btnSave.Size = new Size(117, 80);
-            btnSave.TabIndex = 28;
-            btnSave.Text = "Lưu cấu hình";
-            btnSave.UseVisualStyleBackColor = false;
-            btnSave.Click += btnSave_Click;
+            chkEnableAlert.Text = "Enable/Disable sending message alerts";
             // 
             // lblAppSelect
             // 
@@ -282,9 +302,9 @@
             lblAppSelect.Location = new Point(7, 96);
             lblAppSelect.Margin = new Padding(4, 0, 4, 0);
             lblAppSelect.Name = "lblAppSelect";
-            lblAppSelect.Size = new Size(91, 15);
+            lblAppSelect.Size = new Size(103, 15);
             lblAppSelect.TabIndex = 25;
-            lblAppSelect.Text = "Chọn ứng dụng";
+            lblAppSelect.Text = "Select applycation";
             // 
             // cmbMessageSelect
             // 
@@ -337,6 +357,24 @@
             panel6.Name = "panel6";
             panel6.Size = new Size(404, 201);
             panel6.TabIndex = 1;
+            // 
+            // label4
+            // 
+            label4.Anchor = AnchorStyles.Left;
+            label4.AutoSize = true;
+            label4.Location = new Point(8, 138);
+            label4.Margin = new Padding(4, 0, 4, 0);
+            label4.Name = "label4";
+            label4.Size = new Size(46, 15);
+            label4.TabIndex = 36;
+            label4.Text = "Chat ID";
+            // 
+            // txbChatID
+            // 
+            txbChatID.Location = new Point(8, 161);
+            txbChatID.Name = "txbChatID";
+            txbChatID.Size = new Size(225, 23);
+            txbChatID.TabIndex = 35;
             // 
             // btnDelete_Mes
             // 
@@ -433,27 +471,9 @@
             label1.Location = new Point(96, 10);
             label1.Margin = new Padding(4, 0, 4, 0);
             label1.Name = "label1";
-            label1.Size = new Size(211, 15);
+            label1.Size = new Size(199, 15);
             label1.TabIndex = 24;
-            label1.Text = "Quản lý người nhận tin nhắn cảnh báo";
-            // 
-            // label4
-            // 
-            label4.Anchor = AnchorStyles.Left;
-            label4.AutoSize = true;
-            label4.Location = new Point(8, 138);
-            label4.Margin = new Padding(4, 0, 4, 0);
-            label4.Name = "label4";
-            label4.Size = new Size(46, 15);
-            label4.TabIndex = 36;
-            label4.Text = "Chat ID";
-            // 
-            // txbChatID
-            // 
-            txbChatID.Location = new Point(8, 161);
-            txbChatID.Name = "txbChatID";
-            txbChatID.Size = new Size(225, 23);
-            txbChatID.TabIndex = 35;
+            label1.Text = "Manage warning message recipients";
             // 
             // FormConfigMessage
             // 
@@ -500,7 +520,6 @@
         private Label lblSubtitle;
         private GroupBox gbSendingMode;
         private CheckBox chkEnableAlert;
-        private Button btnSave;
         private Label lblAppSelect;
         private ComboBox cmbMessageSelect;
         private ComboBox cmbAppSelect;
@@ -516,5 +535,7 @@
         private Button btnUpdate_Mes;
         private Label label4;
         private TextBox txbChatID;
+        private CheckBox chkByPass;
+        private Button btnSave;
     }
 }

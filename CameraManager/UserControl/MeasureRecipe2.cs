@@ -2,6 +2,7 @@
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.Drawing;
+using System.Drawing.Imaging;
 using System.Data;
 using System.Linq;
 using System.Text;
@@ -41,7 +42,6 @@ namespace CameraManager
         public MeasureRecipe2()
         {
             InitializeComponent();
-            SetOutputView();
         }
         public void InitPageSetup(Form1 obj, int index, string title = "")
         {
@@ -93,13 +93,11 @@ namespace CameraManager
 
         #endregion
 
-        #region function
+        #region Function
         public void RefreshSetupUI()
         {
             btnRefreshRecipe_Click(null, null);
         }
-
-
         private void UncheckControl(CheckBox control)
         {
             //for (int i = 0; i < ListCheckControl.Length; i++)
@@ -124,33 +122,218 @@ namespace CameraManager
         {
             this.BringToFront();
         }
-
         #endregion
 
         #region Run and Simulate
         List<string> ListImagePaths = new List<string>();
         int m_indexRun = 0;
-        private void toolStripRun_Click(object sender, EventArgs e)
+        private async void toolStripRun_Click(object sender, EventArgs e)
         {
             try
             {
-                //if (InputImage != null)
-                //{
-                //    RunProcess(InputImage);
-                //    SetImage(Result.OutputImage, Result.Graphics, true);
-                //}
-                //else
-                if (ListImagePaths.Count > 0)
+                if (ListImagePaths.Count == 0)
                 {
-                    Bitmap bmp = (Bitmap)System.Drawing.Image.FromFile(ListImagePaths[0]);
-                    //RunProcess_Image(bmp);
+                    ClassCommon.ShowMessageBoxShort("None InputImage", "Null", 500);
+                    return;
                 }
+
+                string path = ListImagePaths[0];
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+
+                // Load original image
+                Bitmap original;
+                using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                using (var imgTmp = Image.FromStream(fs))
+                {
+                    original = new Bitmap(imgTmp);
+                }
+
+                int detectSize = Math.Max(1, ClassSystemConfig.Ins?.m_ClsCommon?.DetectionInputSize ?? 640);
+                using (var resized = ResizeToSquare(original, detectSize))
+                {
+                    // Encode JPEG
+                    byte[] jpeg = EncodeJpeg(resized, 75L);
+                    string base64 = Convert.ToBase64String(jpeg);
+
+                    // Send to API
+                    string apiUrl = ClassSystemConfig.Ins?.m_ClsCommon?.url_Server ?? "http://127.0.0.1:8000/predict";
+                    var payload = new { image = base64 };
+                    var json = JsonConvert.SerializeObject(payload);
+                    using var content = new StringContent(json, Encoding.UTF8, "application/json");
+                    var resp = await client.PostAsync(apiUrl, content);
+                    if (!resp.IsSuccessStatusCode)
+                    {
+                        toolStripStatus.Text = $"API error: {(int)resp.StatusCode}";
+                        original.Dispose();
+                        return;
+                    }
+                    var respText = await resp.Content.ReadAsStringAsync();
+                    var detectionsRaw = JsonConvert.DeserializeObject<List<Detection>>(respText) ?? new List<Detection>();
+
+                    // Normalize to original frame [0..1]
+                    var detections = NormalizeDetectionsToOriginalFrame(detectionsRaw, original.Width, original.Height, detectSize);
+
+                    // Thresholds
+                    double sParamFlame = Convert.ToDouble(numFlame_Sen.Value);
+                    double sParamSmoke = Convert.ToDouble(numSmoke_Sen.Value);
+
+                    // Draw filtered detections
+                    using (var annotated = (Bitmap)original.Clone())
+                    using (var g = Graphics.FromImage(annotated))
+                    {
+                        foreach (var d in detections)
+                        {
+                            if (d == null) continue;
+                            var label = (d.label ?? string.Empty).Trim();
+                            bool isFire = label.Equals("fire", StringComparison.OrdinalIgnoreCase) || label.Equals("flame", StringComparison.OrdinalIgnoreCase) || label.IndexOf("fire", StringComparison.OrdinalIgnoreCase) >= 0 || label.IndexOf("flame", StringComparison.OrdinalIgnoreCase) >= 0;
+                            bool isSmoke = label.Equals("smoke", StringComparison.OrdinalIgnoreCase) || label.IndexOf("smoke", StringComparison.OrdinalIgnoreCase) >= 0;
+                            if (isFire && d.score < sParamFlame) continue;
+                            if (isSmoke && d.score < sParamSmoke) continue;
+                            if (!isFire && !isSmoke) continue;
+
+                            // map to pixels
+                            int x1 = (int)(d.x1 * annotated.Width);
+                            int y1 = (int)(d.y1 * annotated.Height);
+                            int x2 = (int)(d.x2 * annotated.Width);
+                            int y2 = (int)(d.y2 * annotated.Height);
+
+                            int left = Math.Max(0, Math.Min(annotated.Width - 1, Math.Min(x1, x2)));
+                            int top = Math.Max(0, Math.Min(annotated.Height - 1, Math.Min(y1, y2)));
+                            int right = Math.Max(0, Math.Min(annotated.Width - 1, Math.Max(x1, x2)));
+                            int bottom = Math.Max(0, Math.Min(annotated.Height - 1, Math.Max(y1, y2)));
+                            int w = Math.Max(1, right - left);
+                            int h = Math.Max(1, bottom - top);
+
+                            using (var pen = new Pen(Color.Red, 2))
+                            {
+                                g.DrawRectangle(pen, new Rectangle(left, top, w, h));
+                            }
+                            using (var font = new Font("Arial", 11, FontStyle.Bold))
+                            using (var brush = new SolidBrush(Color.White))
+                            {
+                                string txt = $"{(isFire ? "FIRE" : "SMOKE")} {d.score:F2}";
+                                g.DrawString(txt, font, brush, new PointF(left + 3, Math.Max(0, top - 18)));
+                            }
+                        }
+
+                        // Show annotated image
+                        var old = pictureBox1.Image;
+                        pictureBox1.Image = (Bitmap)annotated.Clone();
+                        pictureBox1.SizeMode = PictureBoxSizeMode.Zoom;
+                        old?.Dispose();
+                    }
+                }
+
+                sw.Stop();
+                toolStripProcessTime.Text = $"Time: {sw.ElapsedMilliseconds} ms";
+                toolStripStatus.Text = "Done";
+
+                original.Dispose();
+            }
+            catch (Exception ex)
+            {
+                toolStripStatus.Text = "Error";
+                try { ClassSystemConfig.Ins.m_ClsFunc.SaveLog(ClassFunction.SAVING_LOG_TYPE.EXCEPTION, $"RunImage -> {ex.Message}", ClassSystemConfig.Ins.m_ClsCommon.IsSaveLog_Local, true); } catch { }
+                MessageBox.Show($"Lỗi xử lý: {ex.Message}");
+            }
+        }
+
+        private class Detection
+        {
+            public string label { get; set; }
+            public double x1 { get; set; }
+            public double y1 { get; set; }
+            public double x2 { get; set; }
+            public double y2 { get; set; }
+            public double score { get; set; }
+        }
+
+        private static Bitmap ResizeToSquare(Bitmap src, int size)
+        {
+            if (src == null) return null;
+            if (size <= 0) return (Bitmap)src.Clone();
+            double scale = Math.Min((double)size / src.Width, (double)size / src.Height);
+            int newW = Math.Max(1, (int)Math.Round(src.Width * scale));
+            int newH = Math.Max(1, (int)Math.Round(src.Height * scale));
+            int offsetX = (size - newW) / 2;
+            int offsetY = (size - newH) / 2;
+            var dst = new Bitmap(size, size);
+            using (var g = Graphics.FromImage(dst))
+            {
+                g.Clear(Color.Black);
+                g.CompositingQuality = System.Drawing.Drawing2D.CompositingQuality.HighQuality;
+                g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.HighQuality;
+                g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
+                g.DrawImage(src, new Rectangle(offsetX, offsetY, newW, newH));
+            }
+            return dst;
+        }
+
+        private static byte[] EncodeJpeg(Bitmap bmp, long quality)
+        {
+            using var ms = new MemoryStream();
+            var encoder = ImageCodecInfo.GetImageEncoders().FirstOrDefault(e => e.MimeType == "image/jpeg");
+            if (encoder == null)
+            {
+                bmp.Save(ms, ImageFormat.Jpeg);
+                return ms.ToArray();
+            }
+            var encParams = new EncoderParameters(1);
+            encParams.Param[0] = new EncoderParameter(System.Drawing.Imaging.Encoder.Quality, quality);
+            bmp.Save(ms, encoder, encParams);
+            return ms.ToArray();
+        }
+
+        private List<Detection> NormalizeDetectionsToOriginalFrame(List<Detection> input, int frameW, int frameH, int squareSize)
+        {
+            try
+            {
+                if (input == null || input.Count == 0) return new List<Detection>();
+                if (frameW <= 0 || frameH <= 0 || squareSize <= 0) return new List<Detection>(input);
+
+                double scale = Math.Min((double)squareSize / frameW, (double)squareSize / frameH);
+                double newW = frameW * scale;
+                double newH = frameH * scale;
+                double offX = (squareSize - newW) / 2.0;
+                double offY = (squareSize - newH) / 2.0;
+
+                var list = new List<Detection>(input.Count);
+                foreach (var d in input)
+                {
+                    if (d == null) continue;
+                    bool squareNormalized = d.x2 <= 1.5 && d.y2 <= 1.5 && d.x1 >= 0 && d.y1 >= 0;
+
+                    double sx1 = squareNormalized ? d.x1 * squareSize : d.x1;
+                    double sy1 = squareNormalized ? d.y1 * squareSize : d.y1;
+                    double sx2 = squareNormalized ? d.x2 * squareSize : d.x2;
+                    double sy2 = squareNormalized ? d.y2 * squareSize : d.y2;
+
+                    double ox1 = (sx1 - offX) / scale;
+                    double oy1 = (sy1 - offY) / scale;
+                    double ox2 = (sx2 - offX) / scale;
+                    double oy2 = (sy2 - offY) / scale;
+
+                    ox1 = Math.Max(0, Math.Min(frameW, ox1));
+                    oy1 = Math.Max(0, Math.Min(frameH, oy1));
+                    ox2 = Math.Max(0, Math.Min(frameW, ox2));
+                    oy2 = Math.Max(0, Math.Min(frameH, oy2));
+
+                    list.Add(new Detection
+                    {
+                        label = d.label,
+                        score = d.score,
+                        x1 = frameW > 0 ? ox1 / frameW : 0,
+                        y1 = frameH > 0 ? oy1 / frameH : 0,
+                        x2 = frameW > 0 ? ox2 / frameW : 0,
+                        y2 = frameH > 0 ? oy2 / frameH : 0,
+                    });
+                }
+                return list;
             }
             catch
             {
-
+                return new List<Detection>(input);
             }
-
         }
 
         private void toolStripRunNext_Click(object sender, EventArgs e)
@@ -191,6 +374,16 @@ namespace CameraManager
             {
                 ListImagePaths.Clear();
                 ListImagePaths.Add(fileDialog.FileName);
+                // Load ngay ảnh đầu tiên vào pictureBox1 để hiển thị
+                try
+                {
+                    DisplayImageToPictureBox(fileDialog.FileName);
+                }
+                catch (Exception ex)
+                {
+                    try { ClassSystemConfig.Ins.m_ClsFunc.SaveLog(ClassFunction.SAVING_LOG_TYPE.EXCEPTION, $"OpenImage -> {ex.Message}", ClassSystemConfig.Ins.m_ClsCommon.IsSaveLog_Local, true); } catch { }
+                    MessageBox.Show($"Không thể mở ảnh: {ex.Message}", "Lỗi mở ảnh", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                }
             }
         }
 
@@ -208,233 +401,28 @@ namespace CameraManager
             }
         }
 
-        private void toolStripLoad_Click(object sender, EventArgs e)
+        private void DisplayImageToPictureBox(string path)
         {
-            //LoadModel(m_IndexRecipe, ClassSystemConfig.Ins.m_ClsCommon.m_strRecipeName, true);
-        }
-        private void toolStripSave_Click(object sender, EventArgs e)
-        {
-            //SaveModel(m_IndexRecipe, ClassSystemConfig.Ins.m_ClsCommon.m_strRecipeName, true);
-        }
-        //public Mat ConvertBitmapToMat(Bitmap bitmap)
-        //{
-        //    // Tạo một đối tượng Mat từ Bitmap
-        //    Mat mat = new Mat(bitmap.Height, bitmap.Width, MatType.CV_8UC3);
-
-        //    // Chuyển đổi Bitmap thành Mat
-        //    BitmapConverter.ToMat(bitmap, mat);
-
-        //    return mat;
-        //}
-        //private async void RunProcess_Image(Bitmap inputImage)
-        //{
-        //    Mat frame = new Mat();
-        //    Mat frame_resize = new Mat();
-        //    frame = ConvertBitmapToMat(inputImage);
-        //    Cogdisplay.StaticGraphics.Clear();
-        //    int width_img = frame.Width;
-        //    int height_img = frame.Height;
-        //    if (inputImage == null)
-        //    {
-        //        Console.WriteLine("Lỗi: Không thể đọc frame hoặc hết video.");
-        //    }
-
-        //    Cv2.Resize(frame, frame_resize, new OpenCvSharp.Size(1280, 1280));
-        //    //byte[] frameBytes = ConvertMatToByteArray(frame);
-        //    string image_str = ClassSystemConfig.Ins.m_ClsFunc.ImageToBase64(frame_resize);
-        //    int length = image_str.Length;
-        //    DateTime _time1 = DateTime.Now;
-        //    string predictionResult = await Predict_b64(image_str);
-        //    double total_time = (DateTime.Now - _time1).TotalMilliseconds;
-        //    Console.WriteLine("Time detect: " + total_time.ToString("F2"));
-
-        //    if (predictionResult.Contains("Error"))
-        //        goto END;
-
-        //    var result = JsonConvert.DeserializeObject<List<Detection>>(predictionResult);
-        //    if (result == null)
-        //        return;
-        //    foreach (var detection in result)
-        //    {
-        //        string label = detection.label;
-        //        double x1 = Convert.ToDouble(detection.x1);
-        //        double y1 = Convert.ToDouble(detection.y1);
-        //        double x2 = Convert.ToDouble(detection.x2);
-        //        double y2 = Convert.ToDouble(detection.y2);
-        //        double score = Convert.ToDouble(detection.score);
-
-        //        DrawGraphic(label, x1, y1, x2, y2, score, width_img, height_img);
-        //    }
-        //END:
-        //    CogImage24PlanarColor outputImage = new CogImage24PlanarColor(frame.ToBitmap());
-        //    SetImage(outputImage);
-        //    Thread.Sleep(5);
-
-        //}
-        //public void DrawGraphic(string name, double x1, double y1, double x2, double y2, double score, int originalWidth, int originalHeight)
-        //{
-        //    double sParamFlame = Convert.ToDouble(numFlame_Sen.Value);
-        //    double sParamSmoke = Convert.ToDouble(numSmoke_Sen.Value);
-        //    if (name == "SMOKE")
-        //    {
-        //        if (score < sParamSmoke)
-        //        {
-        //            return;
-        //        }
-        //    }
-        //    else
-        //    {
-        //        if (score < sParamFlame)
-        //        {
-        //            return;
-        //        }
-        //    }
-        //        CogColorConstants color;
-        //    if (name == "SMOKE")
-        //        color = CogColorConstants.Cyan;
-        //    else
-        //        color = CogColorConstants.Red;
-
-        //    int resizeWidth = 1280, resizeHeight = 1280;
-
-        //    int x1Original = (int)(x1 * originalWidth / (float)resizeWidth);
-        //    int y1Original = (int)(y1 * originalHeight / (float)resizeHeight);
-        //    int x2Original = (int)(x2 * originalWidth / (float)resizeWidth);
-        //    int y2Original = (int)(y2 * originalHeight / (float)resizeHeight);
-
-        //    double width = Math.Abs(x2Original - x1Original);
-        //    double height = Math.Abs(y2Original - y1Original);
-        //    Console.WriteLine("Width : " + width.ToString("F2") + " Height: " + height.ToString("F2"));
-
-        //    //Resize region detect color
-        //    CogRectangleAffine rec = new CogRectangleAffine();
-        //    rec.SetOriginLengthsRotationSkew(x1Original, y1Original, width, height, 0, 0);
-        //    rec.Color = color;
-        //    rec.LineWidthInScreenPixels = 2;
-        //    Cogdisplay.StaticGraphics.Add(rec, "rect");
-
-        //    CogGraphicLabel label = new CogGraphicLabel();
-        //    label.Alignment = CogGraphicLabelAlignmentConstants.BottomLeft;
-        //    label.Font = new Font("Century Gothic", 12, FontStyle.Bold);
-        //    label.Color = CogColorConstants.White;
-        //    label.BackgroundColor = color;
-        //    label.SetXYText(x1Original, y1Original, name.ToUpper() + ": " + score.ToString("F2"));
-        //    Cogdisplay.StaticGraphics.Add(label, "label");
-        //}
-        //public async Task<string> Predict_b64(string base64Image)
-        //{
-        //    try
-        //    {
-        //        #region Image
-        //        // Thêm ảnh vào yêu cầu với key là "file"
-        //        var jsonContent = new StringContent(
-        //        $"{{\"image\": \"{base64Image}\"}}",
-        //        Encoding.UTF8,
-        //        "application/json");
-        //        #endregion
-
-        //        DateTime _time1 = DateTime.Now;
-        //        // Đóng kết nối khi xong
-        //        var response = await client.PostAsync(ClassSystemConfig.Ins.m_ClsCommon.url_Server, jsonContent);
-        //        double total_time = (DateTime.Now - _time1).TotalMilliseconds;
-        //        Console.WriteLine("Time detect: " + total_time.ToString("F2"));
-        //        // Kiểm tra kết quả
-        //        if (response.IsSuccessStatusCode)
-        //        {
-        //            // Đọc response body dưới dạng chuỗi JSON
-        //            string responseBody = await response.Content.ReadAsStringAsync();
-
-        //            // Deserialize JSON thành danh sách các phát hiện
-        //            var result = JsonConvert.DeserializeObject<List<Detection>>(responseBody);
-
-        //            if (result != null)
-        //            {
-        //                foreach (var detection in result)
-        //                {
-        //                    Console.WriteLine($"{detection.label}: ({detection.x1}, {detection.y1}) - ({detection.x2}, {detection.y2}), Score: {detection.score}");
-        //                }
-        //            }
-
-        //            return responseBody;
-        //        }
-        //        else
-        //        {
-        //            return ("Error: " + response.StatusCode);
-        //        }
-        //    }
-        //    catch (Exception ex)
-        //    {
-        //        MessageBox.Show("Lỗi chưa start docker!" + ex);
-        //        return ("Error: " + ex);
-
-        //    }
-        //}
-
-        #endregion
-
-        #region DataTable1: Manage Tool Base 
-        private void dataGridView1_SelectionChanged(object sender, EventArgs e)
-        {
-            if (dgviewCamera.CurrentRow == null)
-                return;
-            int iSelected = dgviewCamera.CurrentRow.Index;
-            m_indexCamera = iSelected;
-            int STT = iSelected + 1;
-            if (iSelected >= 0)
+            if (string.IsNullOrWhiteSpace(path) || !System.IO.File.Exists(path))
             {
-                if (connection.State != ConnectionState.Open)
-                {
-                    connection.Open();
-                }
-                string query = "SELECT FrameInterval, Flame_Sensitivity, Smoke_Sensitivity FROM camera_list WHERE STT = @STT";
-                using (MySqlCommand cmd = new MySqlCommand(query, connection))
-                {
-                    cmd.Parameters.AddWithValue("@STT", STT);
+                throw new FileNotFoundException("File không tồn tại", path);
+            }
 
-                    using (MySqlDataReader reader = cmd.ExecuteReader())
-                    {
-                        if (reader.Read())
-                        {
-                            numInterval.Value = reader.GetDecimal(0);
-                            numFlame_Sen.Value = reader.GetDecimal(1);
-                            numSmoke_Sen.Value = reader.GetDecimal(2);
-                        }
-                    }
-                }
+            // Đọc ảnh an toàn để không giữ file lock
+            using (var fs = new System.IO.FileStream(path, System.IO.FileMode.Open, System.IO.FileAccess.Read, System.IO.FileShare.ReadWrite))
+            using (var imgTmp = System.Drawing.Image.FromStream(fs))
+            {
+                var bmp = new Bitmap(imgTmp);
+                var old = pictureBox1.Image;
+                pictureBox1.Image = bmp;
+                pictureBox1.SizeMode = PictureBoxSizeMode.Zoom;
+                old?.Dispose();
             }
         }
 
-        private void btnRemoveToolBase_Click(object sender, EventArgs e)
-        {
-            if (dgviewCamera.CurrentRow == null)
-                return;
-            int iSelected = dgviewCamera.CurrentRow.Index;
-            //if (iSelected >= 0 && iSelected < ListBaseTool.Count)
-            //{
+        #endregion
 
-            //    string tool_name = ListBaseTool[iSelected].Name;
-            //    if (MessageBox.Show("Do you want to delete this tool " + tool_name, "Delete Tool", MessageBoxButtons.YesNo) == DialogResult.Yes)
-            //    {
-            //        dataGridView1.Rows.RemoveAt(iSelected);
-            //        ListBaseTool.RemoveAt(iSelected);
-
-            //        ClassCommon.ShowMessageBoxShort("Removed Tool " + tool_name + " Complete", "Remove", 1000);
-            //    }
-            //}
-        }
-
-        private void AddNewRowData1(string name, string type)
-        {
-            // Add To DataGridView
-            if (type != null && type.Contains("Cog"))
-                type = type.Replace("Cog", "");
-            object[] row = new object[3];
-            row[0] = dgviewCamera.Rows.Count;
-            row[1] = name;
-            row[2] = type;
-
-            dgviewCamera.Rows.Add(row);
-        }
+        #region DataTable:
         private void btnSortDown1_Click(object sender, EventArgs e)
         {
             if (dgviewCamera.CurrentRow == null)
@@ -679,6 +667,10 @@ namespace CameraManager
         {
             try
             {
+                if (connection.State != ConnectionState.Open)
+                {
+                    connection.Open();  // 🔥 Mở kết nối trước khi dùng
+                }
                 // Mở kết nối
                 using (MySqlCommand cmd = new MySqlCommand(updateQuery, connection))
                 {
@@ -753,9 +745,35 @@ namespace CameraManager
             UpdateDataBase();
         }
 
-        private void label5_Click(object sender, EventArgs e)
+        private void dgviewCamera_SelectionChanged(object sender, EventArgs e)
         {
+            if (dgviewCamera.CurrentRow == null)
+                return;
+            int iSelected = dgviewCamera.CurrentRow.Index;
+            m_indexCamera = iSelected;
+            int STT = iSelected + 1;
+            if (iSelected >= 0)
+            {
+                if (connection.State != ConnectionState.Open)
+                {
+                    connection.Open();
+                }
+                string query = "SELECT FrameInterval, Flame_Sensitivity, Smoke_Sensitivity FROM camera_list WHERE STT = @STT";
+                using (MySqlCommand cmd = new MySqlCommand(query, connection))
+                {
+                    cmd.Parameters.AddWithValue("@STT", STT);
 
+                    using (MySqlDataReader reader = cmd.ExecuteReader())
+                    {
+                        if (reader.Read())
+                        {
+                            numInterval.Value = reader.GetDecimal(0);
+                            numFlame_Sen.Value = reader.GetDecimal(1);
+                            numSmoke_Sen.Value = reader.GetDecimal(2);
+                        }
+                    }
+                }
+            }
         }
     }
 

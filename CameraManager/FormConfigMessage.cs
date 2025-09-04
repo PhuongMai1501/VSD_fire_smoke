@@ -88,7 +88,8 @@ namespace CameraManager
                 {
                     // SAVING
                     objWriter.WriteLine("[SEND MESSAGE MODE]  " + (ClassSystemConfig.Ins.m_ClsCommon.m_iFormatSendMessage));
-                    objWriter.WriteLine("[ENABLE ALERT]  " + (chkEnableAlert.Checked ? "1" : "0"));
+                    // ByPass: 1=bỏ qua (không gửi), 0=gửi
+                    objWriter.WriteLine("[BYPASS ALERT]  " + (chkByPass.Checked ? "1" : "0"));
                     objWriter.Close();
                 }
                 if (ShowMessage)
@@ -120,8 +121,20 @@ namespace CameraManager
                     try
                     {
                         ClassSystemConfig.Ins.m_ClsCommon.m_iFormatSendMessage = ClassSystemConfig.Ins.m_ClsCommon.ConvertStringToInt(ClassCommon.GetConfig(file_name, "SEND MESSAGE MODE", "0"), 0);
-                        ClassSystemConfig.Ins.m_ClsCommon.b_ByPassAlarm = Convert.ToInt32(ClassCommon.GetConfig(file_name, "ENABLE ALERT", "0"));
-                        chkEnableAlert.Checked = (ClassSystemConfig.Ins.m_ClsCommon.b_ByPassAlarm == 1);
+                        // đọc BYPASS ALERT; nếu không có thì suy ra từ ENABLE ALERT (enable=1 => bypass=0)
+                        string bypassStr = ClassCommon.GetConfig(file_name, "BYPASS ALERT", "");
+                        if (string.IsNullOrWhiteSpace(bypassStr))
+                        {
+                            string enableStr = ClassCommon.GetConfig(file_name, "ENABLE ALERT", "0");
+                            int enable = 0; int.TryParse(enableStr, out enable);
+                            ClassSystemConfig.Ins.m_ClsCommon.b_ByPassAlarm = (enable == 1) ? 0 : 1;
+                        }
+                        else
+                        {
+                            int bypass = 0; int.TryParse(bypassStr, out bypass);
+                            ClassSystemConfig.Ins.m_ClsCommon.b_ByPassAlarm = (bypass == 1) ? 1 : 0;
+                        }
+                        chkByPass.Checked = (ClassSystemConfig.Ins.m_ClsCommon.b_ByPassAlarm == 1);
                     }
                     catch { }
 
@@ -144,6 +157,35 @@ namespace CameraManager
             LoadDeviceConfig(false);
             InitComboBoxes();
             UpdateAlarmMes();
+            // Cập nhật màu nền ByPass theo trạng thái và gắn sự kiện thay đổi
+            UpdateByPassCheckboxStyle();
+        }
+        private void UpdateByPassCheckboxStyle()
+        {
+            if (chkByPass.Checked)
+            {
+                chkByPass.BackColor = System.Drawing.Color.LimeGreen;
+                chkByPass.ForeColor = System.Drawing.Color.White;
+            }
+            else
+            {
+                chkByPass.BackColor = System.Drawing.Color.Gainsboro;
+                chkByPass.ForeColor = System.Drawing.Color.Black;
+            }
+        }
+        private void chkByPass_CheckedChanged(object sender, EventArgs e)
+        {
+            try
+            {
+                // Cập nhật runtime: ByPass 1=bật (không gửi), 0=tắt (gửi)
+                ClassSystemConfig.Ins.m_ClsCommon.b_ByPassAlarm = chkByPass.Checked ? 1 : 0;
+                UpdateByPassCheckboxStyle();
+                // Không lưu ngay, bấm Save để lưu vào file
+                ClassSystemConfig.Ins.m_ClsFunc.SaveLog(ClassFunction.SAVING_LOG_TYPE.PROGRAM,
+                    $"BYPASS {(chkByPass.Checked ? "ON" : "OFF")}",
+                    ClassSystemConfig.Ins.m_ClsCommon.IsSaveLog_Local, true);
+            }
+            catch { }
         }
         #region Config Message
         private async void btnTest_Click(object sender, EventArgs e)
@@ -525,6 +567,7 @@ namespace CameraManager
                 DeleteAlarmMes(id);
             }
         }
+
         #endregion
     }
 }

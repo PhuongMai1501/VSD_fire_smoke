@@ -218,6 +218,7 @@
             dgviewLog.Dock = DockStyle.Fill;
             dgviewLog.Location = new Point(0, 0);
             dgviewLog.Name = "dgviewLog";
+            dgviewLog.RowHeadersVisible = false;
             dgviewLog.Size = new Size(202, 475);
             dgviewLog.TabIndex = 0;
             // 
