@@ -70,6 +70,10 @@ namespace CameraManager
         private readonly System.Windows.Forms.Timer _detectionTimer = new System.Windows.Forms.Timer();
         private readonly System.Windows.Forms.Timer _detectionCleanupTimer = new System.Windows.Forms.Timer();
 
+        // Per-camera thresholds loaded from DB (key: STT)
+        private readonly Dictionary<int, (double flame, double smoke)> _thresholdsByStt = new Dictionary<int, (double flame, double smoke)>();
+        private readonly object _thresholdsLock = new object();
+
         // Store frame for AI detection processing
         private readonly Dictionary<int, Bitmap> _latestFrames = new Dictionary<int, Bitmap>();
         private readonly object _frameStoreLock = new object();
@@ -122,6 +126,8 @@ namespace CameraManager
 
                 InitializeUI();
                 LoadCameraList();
+                // Load per-camera thresholds from database after camera list
+                LoadThresholdsByStt();
 
                 Console.WriteLine($"Camera Configuration: {NumCameras} cameras, {Row}x{Col} grid");
 
@@ -801,24 +807,28 @@ namespace CameraManager
                     FileLogger.Log($"Detect NORM cam {cameraIndex + 1}: cnt={detections.Count} first=({d.label},{d.score:F2}) x1={d.x1:F3},y1={d.y1:F3},x2={d.x2:F3},y2={d.y2:F3}");
                 }
 
+                // Apply per-camera thresholds by STT (cameraIndex + 1)
+                var (thrFlame, thrSmoke) = GetThresholdsForIndex(cameraIndex);
+                var filtered = FilterDetectionsByThreshold(detections, thrFlame, thrSmoke);
+
                 EnsureCameraDetectionsSize(cameraIndex + 1);
                 lock (_cameraDetections)
                 {
                     if (cameraIndex < _cameraDetections.Count)
                     {
                         _cameraDetections[cameraIndex].Clear();
-                        _cameraDetections[cameraIndex].AddRange(detections);
+                        _cameraDetections[cameraIndex].AddRange(filtered);
                     }
                 }
 
-                if (detections.Count > 0)
+                if (filtered.Count > 0)
                 {
-                    try { SaveDetectionImage(cameraIndex, frame, detections); } catch (Exception exSave) { FileLogger.LogException(exSave, "ProcessDetectionAsync -> SaveDetectionImage"); }
+                    try { SaveDetectionImage(cameraIndex, frame, filtered); } catch (Exception exSave) { FileLogger.LogException(exSave, "ProcessDetectionAsync -> SaveDetectionImage"); }
 
                     // Gọi cảnh báo alarm nếu bật và có người nhận active
                     try
                     {
-                        var labels = detections
+                        var labels = filtered
                             .Where(d => d != null && !string.IsNullOrWhiteSpace(d.label))
                             .Select(d => d.label?.Trim() ?? "")
                             .ToList();
@@ -833,8 +843,7 @@ namespace CameraManager
                         FileLogger.LogException(exAlarm, "ProcessDetectionAsync -> SendAlarm");
                     }
                 }
-
-                TriggerPaintEvent(cameraIndex, detections.Count);
+                TriggerPaintEvent(cameraIndex, filtered.Count);
             }
             catch (Exception ex)
             {
@@ -1997,6 +2006,110 @@ namespace CameraManager
             return dst;
         }
 
+        // === Thresholds by STT ===
+        private void LoadThresholdsByStt()
+        {
+            try
+            {
+                string connStr = null;
+                try { connStr = ClassSystemConfig.Ins?.m_ClsCommon?.connectionString; } catch { connStr = null; }
+                if (string.IsNullOrWhiteSpace(connStr))
+                {
+                    FileLogger.Log("LoadThresholdsByStt: Missing connection string");
+                    return;
+                }
+
+                var temp = new Dictionary<int, (double flame, double smoke)>();
+                using (var conn = new MySql.Data.MySqlClient.MySqlConnection(connStr))
+                {
+                    conn.Open();
+                    string sql = "SELECT STT, Flame_Sensitivity, Smoke_Sensitivity FROM camera_list";
+                    using (var cmd = new MySql.Data.MySqlClient.MySqlCommand(sql, conn))
+                    using (var reader = cmd.ExecuteReader())
+                    {
+                        while (reader.Read())
+                        {
+                            int stt = 0;
+                            double flame = 0, smoke = 0;
+                            try { stt = Convert.ToInt32(reader["STT"]); } catch { stt = 0; }
+                            try { flame = Convert.ToDouble(reader["Flame_Sensitivity"]); } catch { flame = 0; }
+                            try { smoke = Convert.ToDouble(reader["Smoke_Sensitivity"]); } catch { smoke = 0; }
+                            if (stt > 0)
+                            {
+                                temp[stt] = (flame, smoke);
+                            }
+                        }
+                    }
+                }
+
+                lock (_thresholdsLock)
+                {
+                    _thresholdsByStt.Clear();
+                    foreach (var kv in temp) _thresholdsByStt[kv.Key] = kv.Value;
+                }
+
+                FileLogger.Log($"Loaded thresholds for {_thresholdsByStt.Count} cameras (by STT)");
+            }
+            catch (Exception ex)
+            {
+                FileLogger.LogException(ex, "LoadThresholdsByStt");
+            }
+        }
+
+        private (double flame, double smoke) GetThresholdsForIndex(int cameraIndex)
+        {
+            try
+            {
+                int stt = cameraIndex + 1; // mapping by STT
+                lock (_thresholdsLock)
+                {
+                    if (_thresholdsByStt.TryGetValue(stt, out var t))
+                    {
+                        return t;
+                    }
+                }
+            }
+            catch { }
+            return (0.0, 0.0);
+        }
+
+        private static bool IsFireLabel(string label)
+        {
+            if (string.IsNullOrWhiteSpace(label)) return false;
+            var l = label.Trim();
+            return l.Equals("fire", StringComparison.OrdinalIgnoreCase)
+                   || l.Equals("flame", StringComparison.OrdinalIgnoreCase)
+                   || l.IndexOf("fire", StringComparison.OrdinalIgnoreCase) >= 0
+                   || l.IndexOf("flame", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        private static bool IsSmokeLabel(string label)
+        {
+            if (string.IsNullOrWhiteSpace(label)) return false;
+            var l = label.Trim();
+            return l.Equals("smoke", StringComparison.OrdinalIgnoreCase)
+                   || l.IndexOf("smoke", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        private static List<Detection> FilterDetectionsByThreshold(List<Detection> detections, double thrFlame, double thrSmoke)
+        {
+            if (detections == null || detections.Count == 0) return new List<Detection>();
+            var list = new List<Detection>();
+            foreach (var d in detections)
+            {
+                if (d == null) continue;
+                if (IsFireLabel(d.label))
+                {
+                    if (d.score >= thrFlame) list.Add(d);
+                }
+                else if (IsSmokeLabel(d.label))
+                {
+                    if (d.score >= thrSmoke) list.Add(d);
+                }
+            }
+            return list;
+        }
+
         private void CleanupResources()
         {
             try
@@ -2103,6 +2216,8 @@ namespace CameraManager
             {
                 Console.WriteLine("?? Reloading camera list from database...");
                 LoadCameraList();
+                // Reload thresholds as well when camera list changes
+                LoadThresholdsByStt();
 
                 if (this.InvokeRequired)
                 {
