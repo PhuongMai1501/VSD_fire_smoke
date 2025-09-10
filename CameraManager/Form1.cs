@@ -19,6 +19,7 @@ using Newtonsoft.Json;
 using MySql.Data.MySqlClient;
 using System.Threading;
 using System.IO;
+using System.Management;
 
 namespace CameraManager
 {
@@ -69,6 +70,16 @@ namespace CameraManager
         private readonly List<List<Detection>> _cameraDetections = new List<List<Detection>>();
         private readonly System.Windows.Forms.Timer _detectionTimer = new System.Windows.Forms.Timer();
         private readonly System.Windows.Forms.Timer _detectionCleanupTimer = new System.Windows.Forms.Timer();
+
+        // Reconnect monitoring (per-camera via DisplayTimer)
+        private readonly Dictionary<int, DateTime> _lastFrameAt = new Dictionary<int, DateTime>();
+        private readonly Dictionary<int, DateTime> _lastStallDetectedAt = new Dictionary<int, DateTime>();
+        private readonly Dictionary<int, DateTime> _lastRestartAt = new Dictionary<int, DateTime>();
+        private readonly HashSet<int> _restartingCameras = new HashSet<int>();
+        private readonly object _reconnectLock = new object();
+        private const int NO_SIGNAL_TIMEOUT_MS = 2000;
+        private const int RESTART_STALL_MS = 7000;
+        private const int RESTART_COOLDOWN_MS = 10000;
 
         // Per-camera thresholds loaded from DB (key: STT)
         private readonly Dictionary<int, (double flame, double smoke)> _thresholdsByStt = new Dictionary<int, (double flame, double smoke)>();
@@ -153,6 +164,7 @@ namespace CameraManager
                 for (int i = 0; i < NumCameras && i < _mmfs.Count && i < _pictureboxes.Count; i++)
                 {
                     UpdatePictureBox(i);
+                    UpdateNoSignalOverlay(i);
                 }
             }
             catch (Exception ex)
@@ -1743,7 +1755,8 @@ namespace CameraManager
                         ClassSystemConfig.Ins.m_ClsCommon.m_bShowOrigin = false; // (ClassCommon.GetConfig(file_name, "SHOW ORIGIN", "1").Trim() == "1") ? true : false;
                         ClassSystemConfig.Ins.m_ClsCommon.m_bShowProgressStatus = (ClassCommon.GetConfig(file_name, "SHOW PROGRESS STATUS", "0").Trim() == "1") ? true : false;
 
-                        ClassSystemConfig.Ins.m_ClsCommon.m_bAutoReconnect = (ClassCommon.GetConfig(file_name, "AUTO RECONNECT", "0").Trim() == "1") ? true : false;
+                        // Always enable auto-reconnect regardless of config
+                        ClassSystemConfig.Ins.m_ClsCommon.m_bAutoReconnect = true;
                         ClassSystemConfig.Ins.m_ClsCommon.IsSaveByFTP = (ClassCommon.GetConfig(file_name, "IS_FTP_SAVING", "1").Trim() == "1") ? true : false;
 
                         ClassSystemConfig.Ins.m_ClsCommon.m_iTimeBetween2Trigger = ClassSystemConfig.Ins.m_ClsCommon.ConvertStringToInt(ClassCommon.GetConfig(file_name, "TIMEOUT GET IMAGE", "1000"), 1000);
@@ -1965,9 +1978,9 @@ namespace CameraManager
 
                 DisplayTimer?.Stop();
                 _detectionTimer?.Stop();
-                _detectionTimer?.Dispose();
                 _detectionCleanupTimer?.Stop();
-                _detectionCleanupTimer?.Dispose();
+
+                // reconnect timer not used in per-camera monitoring
 
                 ForceKillAllCameraWorkers();
 
@@ -2154,6 +2167,15 @@ namespace CameraManager
                     _latestFrames.Clear();
                 }
 
+                // Clear last frame/reconnect state
+                lock (_reconnectLock)
+                {
+                    _lastFrameAt.Clear();
+                    _lastStallDetectedAt.Clear();
+                    _lastRestartAt.Clear();
+                    _restartingCameras.Clear();
+                }
+
                 // Clear picture boxes and dispose old images
                 foreach (var pictureBox in _pictureboxes)
                 {
@@ -2209,6 +2231,208 @@ namespace CameraManager
                 FileLogger.LogException(ex, "ForceKillAllCameraWorkers");
             }
         }
+
+        private void UpdateNoSignalOverlay(int cameraIndex)
+        {
+            try
+            {
+                if (cameraIndex < 0 || cameraIndex >= _pictureboxes.Count) return;
+                var pictureBox = _pictureboxes[cameraIndex];
+                if (pictureBox == null || pictureBox.IsDisposed) return;
+
+                var now = DateTime.Now;
+                bool isStale = true;
+                DateTime last;
+                lock (_reconnectLock)
+                {
+                    if (_lastFrameAt.TryGetValue(cameraIndex, out last))
+                    {
+                        isStale = (now - last).TotalMilliseconds > NO_SIGNAL_TIMEOUT_MS;
+                    }
+                }
+
+                if (isStale)
+                {
+                    if (pictureBox.Controls.Count > 0 && pictureBox.Controls[0] is Label lbl)
+                    {
+                        lbl.Text = $"CAM {cameraIndex + 1}\nNo Signal (reconnecting...)";
+                        lbl.Visible = true;
+                    }
+
+                    TryRestartStalledCamera(cameraIndex, now);
+                }
+                else
+                {
+                    // On fresh signal, ensure overlay hidden (UpdatePictureBox also hides it when setting Image)
+                    if (pictureBox.Controls.Count > 0)
+                    {
+                        pictureBox.Controls[0].Visible = false;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                FileLogger.LogException(ex, $"UpdateNoSignalOverlay - Camera {cameraIndex}");
+            }
+        }
+
+        private void TryRestartStalledCamera(int cameraIndex, DateTime now)
+        {
+            try
+            {
+                bool shouldRestart = false;
+                lock (_reconnectLock)
+                {
+                    if (_restartingCameras.Contains(cameraIndex)) return;
+
+                    // Require stall sustained beyond RESTART_STALL_MS
+                    if (!_lastStallDetectedAt.TryGetValue(cameraIndex, out var firstSeen))
+                    {
+                        _lastStallDetectedAt[cameraIndex] = now;
+                        return;
+                    }
+                    if ((now - firstSeen).TotalMilliseconds < RESTART_STALL_MS)
+                    {
+                        return;
+                    }
+
+                    // Cooldown between restarts
+                    if (_lastRestartAt.TryGetValue(cameraIndex, out var lastRestart))
+                    {
+                        if ((now - lastRestart).TotalMilliseconds < RESTART_COOLDOWN_MS)
+                        {
+                            return;
+                        }
+                    }
+
+                    shouldRestart = true;
+                }
+
+                if (shouldRestart)
+                {
+                    _ = Task.Run(() => RestartWorker(cameraIndex));
+                }
+            }
+            catch (Exception ex)
+            {
+                FileLogger.LogException(ex, $"TryRestartStalledCamera - Camera {cameraIndex}");
+            }
+        }
+
+        private void RestartWorker(int cameraIndex)
+        {
+            if (cameraIndex < 0) return;
+            lock (_reconnectLock)
+            {
+                if (_restartingCameras.Contains(cameraIndex)) return;
+                _restartingCameras.Add(cameraIndex);
+            }
+
+            try
+            {
+                FileLogger.Log($"?? RestartWorker: restarting camera {cameraIndex + 1}");
+
+                // Try to kill the specific CameraWorker process bound to this camera's mutex/MMF
+                TryKillWorkerProcess(cameraIndex);
+
+                // Dispose old supervisor if exists
+                if (cameraIndex < _supervisors.Count && _supervisors[cameraIndex] != null)
+                {
+                    try { _supervisors[cameraIndex]?.Dispose(); } catch { }
+                    _supervisors[cameraIndex] = null;
+                }
+
+                // Build new supervisor with current RTSP config
+                string cameraWorkerPath = Path.Combine(Environment.CurrentDirectory, "CameraWorker.exe");
+                if (!File.Exists(cameraWorkerPath))
+                {
+                    FileLogger.Log($"RestartWorker: CameraWorker.exe not found at {cameraWorkerPath}");
+                    return;
+                }
+
+                if (ClassSystemConfig.Ins.m_ClsCommon.m_ListRtspCam == null || cameraIndex >= ClassSystemConfig.Ins.m_ClsCommon.m_ListRtspCam.Count)
+                {
+                    FileLogger.Log($"RestartWorker: invalid RTSP index {cameraIndex}");
+                    return;
+                }
+
+                string rtspUrl = ClassSystemConfig.Ins.m_ClsCommon.m_ListRtspCam[cameraIndex];
+                string mmfName = $"Cam_{cameraIndex}_MMF";
+                string mutexName = $"Global\\Cam_{cameraIndex}_Mutex";
+                string sttArg = (cameraIndex + 1).ToString();
+                string connStrArg = ClassSystemConfig.Ins?.m_ClsCommon?.connectionString ?? string.Empty;
+                string arguments = $"\"{rtspUrl}\" {mmfName} {mutexName} {sttArg} \"{connStrArg}\"";
+
+                var supervisor = new ProcessSupervisor(
+                    loggerFactory: NullLoggerFactory.Instance,
+                    processRunType: ProcessRunType.NonTerminating,
+                    processPath: cameraWorkerPath,
+                    arguments: arguments,
+                    workingDirectory: Environment.CurrentDirectory
+                );
+
+                // Ensure list capacity
+                while (_supervisors.Count <= cameraIndex) _supervisors.Add(null);
+                _supervisors[cameraIndex] = supervisor;
+                supervisor.Start();
+
+                // Reset timers for this camera
+                lock (_reconnectLock)
+                {
+                    _lastRestartAt[cameraIndex] = DateTime.Now;
+                    _lastStallDetectedAt.Remove(cameraIndex);
+                    _lastFrameAt.Remove(cameraIndex);
+                }
+
+                FileLogger.Log($"? RestartWorker: camera {cameraIndex + 1} restarted");
+            }
+            catch (Exception ex)
+            {
+                FileLogger.LogException(ex, $"RestartWorker - Camera {cameraIndex}");
+            }
+            finally
+            {
+                lock (_reconnectLock)
+                {
+                    _restartingCameras.Remove(cameraIndex);
+                }
+            }
+        }
+
+        private void TryKillWorkerProcess(int cameraIndex)
+        {
+            try
+            {
+                string mmfName = $"Cam_{cameraIndex}_MMF";
+                string mutexName = $"Global\\Cam_{cameraIndex}_Mutex";
+                var searcher = new ManagementObjectSearcher("SELECT ProcessId, CommandLine FROM Win32_Process WHERE Name='CameraWorker.exe'");
+                foreach (ManagementObject proc in searcher.Get())
+                {
+                    string cmd = proc["CommandLine"]?.ToString() ?? string.Empty;
+                    if (cmd.Contains(mmfName) || cmd.Contains(mutexName))
+                    {
+                        try
+                        {
+                            int pid = Convert.ToInt32(proc["ProcessId"]);
+                            var p = System.Diagnostics.Process.GetProcessById(pid);
+                            FileLogger.Log($"RestartWorker: killing old worker PID {pid} for camera {cameraIndex + 1}");
+                            p.Kill();
+                            p.WaitForExit(1000);
+                            p.Dispose();
+                        }
+                        catch (Exception ex)
+                        {
+                            FileLogger.LogException(ex, $"TryKillWorkerProcess - Camera {cameraIndex}");
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                FileLogger.LogException(ex, $"TryKillWorkerProcess(root) - Camera {cameraIndex}");
+            }
+        }
+        // === Auto Reconnect (per-camera) implemented via UpdateNoSignalOverlay/TryRestartStalledCamera/RestartWorker ===
 
         public void ReloadCameraList()
         {
@@ -2315,6 +2539,8 @@ namespace CameraManager
         {
             try
             {
+                // Cho phép chạy lại sau khi đã Stop
+                _isShuttingDown = false;
                 string cameraWorkerPath = Path.Combine(Environment.CurrentDirectory, "CameraWorker.exe");
                 if (!File.Exists(cameraWorkerPath))
                 {
@@ -2351,7 +2577,9 @@ namespace CameraManager
 
                         _mutexes.Add(new Mutex(false, mutexName));
 
-                        string arguments = $"\"{rtspUrl}\" {mmfName} {mutexName}";
+                        string sttArg = (i + 1).ToString();
+                        string connStrArg = ClassSystemConfig.Ins?.m_ClsCommon?.connectionString ?? string.Empty;
+                        string arguments = $"\"{rtspUrl}\" {mmfName} {mutexName} {sttArg} \"{connStrArg}\"";
                         var supervisor = new ProcessSupervisor(
                             loggerFactory: NullLoggerFactory.Instance,
                             processRunType: ProcessRunType.NonTerminating,
@@ -2375,6 +2603,21 @@ namespace CameraManager
 
                 DisplayTimer.Interval = 5;
                 DisplayTimer.Start();
+
+                // Đảm bảo bật lại các timer detection sau khi đã Stop
+                try
+                {
+                    _detectionTimer.Interval = DETECTION_TIMER_INTERVAL_MS;
+                    _detectionTimer.Start();
+                    _detectionCleanupTimer.Interval = 100;
+                    _detectionCleanupTimer.Start();
+                }
+                catch (Exception exTimer)
+                {
+                    FileLogger.LogException(exTimer, "StartCameraSystem -> restart detection timers");
+                }
+
+                // Per-camera reconnect is handled in DisplayTimer via UpdateNoSignalOverlay
 
                 FileLogger.Log($"? Camera system started with {_supervisors.Count}/{actualCameraCount} workers");
             }
@@ -2466,6 +2709,12 @@ namespace CameraManager
                                             {
                                                 _latestFrames.Add(index, (Bitmap)bmp.Clone());
                                             }
+                                        }
+
+                                        // Track last frame time for reconnect monitoring
+                                        lock (_reconnectLock)
+                                        {
+                                            _lastFrameAt[index] = DateTime.Now;
                                         }
 
                                         pictureBox.Invalidate();

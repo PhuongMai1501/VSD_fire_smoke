@@ -3,10 +3,41 @@ using System.IO.MemoryMappedFiles;
 using System.Threading;
 using FFmpeg.AutoGen;
 using FFmpeg.AutoGen.Example;
+using MySql.Data.MySqlClient;
 
 public unsafe class Program
 {
     private static bool _shouldExit = false;
+    
+    private static string ResolveRtspUrl(string defaultUrl, string sttArg, string connStr)
+    {
+        try
+        {
+            if (!string.IsNullOrWhiteSpace(connStr) && int.TryParse(sttArg, out var stt) && stt > 0)
+            {
+                using (var conn = new MySql.Data.MySqlClient.MySqlConnection(connStr))
+                {
+                    conn.Open();
+                    string sql = "SELECT RTSP_URL FROM camera_list WHERE STT = @stt LIMIT 1";
+                    using (var cmd = new MySql.Data.MySqlClient.MySqlCommand(sql, conn))
+                    {
+                        cmd.Parameters.AddWithValue("@stt", stt);
+                        var result = cmd.ExecuteScalar()?.ToString();
+                        if (!string.IsNullOrWhiteSpace(result))
+                        {
+                            CameraWorkerLogger.Log($"ResolveRtspUrl: fetched from DB for STT={stt}");
+                            return result.Trim();
+                        }
+                    }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            CameraWorkerLogger.LogException(ex, "ResolveRtspUrl");
+        }
+        return defaultUrl;
+    }
     
     public static void Main(string[] args)
     {
@@ -23,6 +54,8 @@ public unsafe class Program
         string rtspUrl = args[0];
         string mmfName = args[1];
         string mutexName = args[2];
+        string sttArg = args.Length >= 4 ? args[3] : null;
+        string connStr = args.Length >= 5 ? args[4] : null;
 
         CameraWorkerLogger.Log($"RTSP URL: {rtspUrl}");
         CameraWorkerLogger.Log($"MMF Name: {mmfName}");
@@ -48,8 +81,26 @@ public unsafe class Program
             FFmpegBinariesHelper.RegisterFFmpegBinaries();
             CameraWorkerLogger.Log("✅ FFmpeg binaries registered");
 
-            // Start main processing loop
-            ProcessRTSPStream(rtspUrl, mmfName, mutexName);
+            // Start main processing loop with retry
+            int attempt = 0;
+            while (!_shouldExit)
+            {
+                attempt++;
+                string resolvedUrl = ResolveRtspUrl(rtspUrl, sttArg, connStr);
+                CameraWorkerLogger.Log($"=== Attempt #{attempt} starting with URL: {resolvedUrl}");
+                try
+                {
+                    ProcessRTSPStream(resolvedUrl, mmfName, mutexName);
+                }
+                catch (Exception ex)
+                {
+                    CameraWorkerLogger.LogException(ex, "Main loop - ProcessRTSPStream");
+                }
+
+                if (_shouldExit) break;
+                CameraWorkerLogger.Log("Waiting 5000ms before next attempt...");
+                Thread.Sleep(5000);
+            }
         }
         catch (Exception ex)
         {
@@ -85,10 +136,11 @@ public unsafe class Program
             try
             {
                 ffmpeg.av_dict_set(&options, "rtsp_transport", "tcp", 0);
-                ffmpeg.av_dict_set(&options, "stimeout", "10000000", 0); // 10 second timeout
+                ffmpeg.av_dict_set(&options, "stimeout", "5000000", 0); // 5 second open timeout (microseconds)
+                ffmpeg.av_dict_set(&options, "rw_timeout", "5000000", 0); // 5 second read/write timeout
                 ffmpeg.av_dict_set(&options, "probesize", "1000000", 0);
                 ffmpeg.av_dict_set(&options, "analyzeduration", "1000000", 0);
-                ffmpeg.av_dict_set(&options, "max_delay", "500000", 0); // 0.5 seconds
+                ffmpeg.av_dict_set(&options, "max_delay", "250000", 0); // 0.25 seconds
                 ffmpeg.av_dict_set(&options, "fflags", "nobuffer", 0);
 
                 int openResult = ffmpeg.avformat_open_input(&pFormatContext, rtspUrl, null, &options);
