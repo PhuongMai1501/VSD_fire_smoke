@@ -81,6 +81,11 @@ namespace CameraManager
         private const int RESTART_STALL_MS = 7000;
         private const int RESTART_COOLDOWN_MS = 10000;
 
+        // UI toggle for log panel
+        private bool _isLogCollapsed = false;
+        private float _origCol0Width = 20f;
+        private float _origCol1Width = 80f;
+
         // Per-camera thresholds loaded from DB (key: STT)
         private readonly Dictionary<int, (double flame, double smoke)> _thresholdsByStt = new Dictionary<int, (double flame, double smoke)>();
         private readonly object _thresholdsLock = new object();
@@ -115,6 +120,17 @@ namespace CameraManager
             // Enable keyboard events
             this.KeyPreview = true;
             this.WindowState = FormWindowState.Maximized;
+
+            // Capture original column widths for restore
+            try
+            {
+                if (tableLayoutPanel2?.ColumnStyles?.Count >= 2)
+                {
+                    _origCol0Width = tableLayoutPanel2.ColumnStyles[0].Width;
+                    _origCol1Width = tableLayoutPanel2.ColumnStyles[1].Width;
+                }
+            }
+            catch { }
 
             // Handle process exit events to ensure cleanup
             AppDomain.CurrentDomain.ProcessExit += CurrentDomain_ProcessExit;
@@ -2765,6 +2781,62 @@ namespace CameraManager
             ClassSystemConfig.Ins.m_ClsFunc.SaveLog(ClassFunction.SAVING_LOG_TYPE.HANDLER_CLICKED,
                                                     "Clicked Log View",
                                                     ClassSystemConfig.Ins.m_ClsCommon.IsSaveLog_Local, true);
+        }
+
+        private void label1_Click(object sender, EventArgs e)
+        {
+            try
+            {
+                if (tableLayoutPanel2 == null || panelMain == null || panelLog == null) return;
+
+                tableLayoutPanel2.SuspendLayout();
+
+                if (!_isLogCollapsed)
+                {
+                    // Collapse log panel and let main span full width
+                    panelLog.Visible = false;
+                    if (tableLayoutPanel2.ColumnStyles.Count >= 2)
+                    {
+                        tableLayoutPanel2.ColumnStyles[0].SizeType = SizeType.Percent;
+                        tableLayoutPanel2.ColumnStyles[0].Width = 0f;
+                        tableLayoutPanel2.ColumnStyles[1].SizeType = SizeType.Percent;
+                        tableLayoutPanel2.ColumnStyles[1].Width = 100f;
+                    }
+                    try
+                    {
+                        tableLayoutPanel2.SetColumn(panelMain, 0);
+                        tableLayoutPanel2.SetColumnSpan(panelMain, 2);
+                    }
+                    catch { }
+                    _isLogCollapsed = true;
+                }
+                else
+                {
+                    // Restore original layout
+                    try
+                    {
+                        tableLayoutPanel2.SetColumnSpan(panelMain, 1);
+                        tableLayoutPanel2.SetColumn(panelMain, 1);
+                    }
+                    catch { }
+
+                    if (tableLayoutPanel2.ColumnStyles.Count >= 2)
+                    {
+                        tableLayoutPanel2.ColumnStyles[0].SizeType = SizeType.Percent;
+                        tableLayoutPanel2.ColumnStyles[0].Width = _origCol0Width;
+                        tableLayoutPanel2.ColumnStyles[1].SizeType = SizeType.Percent;
+                        tableLayoutPanel2.ColumnStyles[1].Width = _origCol1Width;
+                    }
+                    panelLog.Visible = true;
+                    _isLogCollapsed = false;
+                }
+
+                tableLayoutPanel2.ResumeLayout(true);
+            }
+            catch (Exception ex)
+            {
+                FileLogger.LogException(ex, nameof(label1_Click));
+            }
         }
     }
 }
