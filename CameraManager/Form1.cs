@@ -1715,6 +1715,9 @@ namespace CameraManager
                     objWriter.WriteLine("[SHOW ORIGIN]  " + (ClassSystemConfig.Ins.m_ClsCommon.m_bShowOrigin ? "1" : "0"));
                     objWriter.WriteLine("[SHOW PROGRESS STATUS]  " + (ClassSystemConfig.Ins.m_ClsCommon.m_bShowProgressStatus ? "1" : "0"));
 
+                    // Auto Reconnect behavior
+                    objWriter.WriteLine("[AUTO RECONNECT]  " + (ClassSystemConfig.Ins.m_ClsCommon.m_bAutoReconnect ? "1" : "0"));
+
                     objWriter.Close();
                 }
                 if (ShowMessage)
@@ -2275,6 +2278,7 @@ namespace CameraManager
                         lbl.Visible = true;
                     }
 
+                    // Always attempt restart logic when stale
                     TryRestartStalledCamera(cameraIndex, now);
                 }
                 else
@@ -2326,6 +2330,29 @@ namespace CameraManager
 
                 if (shouldRestart)
                 {
+                    // Optional: Only restart if camera host is reachable (ping OK)
+                    try
+                    {
+                        string rtspUrl = null;
+                        try { rtspUrl = ClassSystemConfig.Ins?.m_ClsCommon?.m_ListRtspCam?[cameraIndex]; } catch { rtspUrl = null; }
+                        if (!string.IsNullOrWhiteSpace(rtspUrl))
+                        {
+                            string host = null;
+                            try { host = new Uri(rtspUrl).Host; } catch { host = null; }
+                            if (!string.IsNullOrWhiteSpace(host))
+                            {
+                                bool pingOk = false;
+                                try { pingOk = ClassSystemConfig.Ins?.m_ClsCommon?.PingRespond(host, 1000, 2) ?? false; } catch { pingOk = false; }
+                                if (!pingOk)
+                                {
+                                    FileLogger.Log($"TryRestartStalledCamera: skip restart cam {cameraIndex + 1} - host {host} not reachable");
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    catch { /* ignore ping exceptions and fall through to restart */ }
+
                     _ = Task.Run(() => RestartWorker(cameraIndex));
                 }
             }
