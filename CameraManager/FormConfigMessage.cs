@@ -12,6 +12,7 @@ using System.Net.Http;
 using System.Text;
 using System.Threading.Tasks;
 using System.Windows.Forms;
+using Newtonsoft.Json;
 
 namespace CameraManager
 {
@@ -35,9 +36,16 @@ namespace CameraManager
             {
                 "Telegram",
                 "Discord",
-                "WhatsApp"
+                "WhatsApp",
+                "Zalo"
             });
-            cmbAppSelect.SelectedIndex = ClassSystemConfig.Ins.m_ClsCommon.m_iFormatSendMessage; // Default to Telegram
+
+            int mode = ClassSystemConfig.Ins.m_ClsCommon.m_iFormatSendMessage;
+            if (mode < 0 || mode >= cmbAppSelect.Items.Count)
+            {
+                mode = 0;
+            }
+            cmbAppSelect.SelectedIndex = mode; // Default to Telegram
 
             // Populate message content combo box
             cmbMessageSelect.Items.Clear();
@@ -60,9 +68,13 @@ namespace CameraManager
             {
                 ClassSystemConfig.Ins.m_ClsCommon.m_iFormatSendMessage = 1;
             }
-            else if (selectedApp == "WWhatsapp")
+            else if (selectedApp == "WhatsApp")
             {
                 ClassSystemConfig.Ins.m_ClsCommon.m_iFormatSendMessage = 2;
+            }
+            else if (selectedApp == "Zalo")
+            {
+                ClassSystemConfig.Ins.m_ClsCommon.m_iFormatSendMessage = 3;
             }
             else
             {
@@ -203,6 +215,10 @@ namespace CameraManager
                 await SendDiscordMessageAsync(message);
                 MessageBox.Show("Đã gửi tin nhắn Discord!");
             }
+            else if (selectedApp == "Zalo")
+            {
+                await SendZaloMessageAsync(message);
+            }
             else
             {
                 MessageBox.Show("Chức năng gửi cho ứng dụng này chưa được hỗ trợ.");
@@ -341,6 +357,117 @@ namespace CameraManager
             else
             {
                 Console.WriteLine("Không tìm thấy channel!");
+            }
+        }
+
+        private async Task SendZaloMessageAsync(string message)
+        {
+            try
+            {
+                if (string.IsNullOrWhiteSpace(message))
+                {
+                    MessageBox.Show("Vui lòng nhập nội dung!");
+                    return;
+                }
+
+                string connStr = ClassSystemConfig.Ins?.m_ClsCommon?.connectionString;
+                if (string.IsNullOrWhiteSpace(connStr))
+                {
+                    MessageBox.Show("Không tìm thấy chuỗi kết nối dữ liệu.");
+                    return;
+                }
+
+                var phones = new List<string>();
+                using (var conn = new MySqlConnection(connStr))
+                {
+                    await conn.OpenAsync();
+                    string sql = "SELECT SDT FROM alarm_mes WHERE IsActive = 1 AND SDT IS NOT NULL AND TRIM(SDT) <> ''";
+                    using (var cmd = new MySqlCommand(sql, conn))
+                    using (var reader = await cmd.ExecuteReaderAsync())
+                    {
+                        while (await reader.ReadAsync())
+                        {
+                            var phone = reader["SDT"]?.ToString()?.Trim();
+                            if (!string.IsNullOrWhiteSpace(phone))
+                            {
+                                phones.Add(phone);
+                            }
+                        }
+                    }
+                }
+
+                if (phones.Count == 0)
+                {
+                    MessageBox.Show("Không có số điện thoại kích hoạt để gửi Zalo!");
+                    return;
+                }
+
+                const string url = "https://rest.esms.vn/MainService.svc/json/MultiChannelMessage/";
+                var sbResult = new StringBuilder();
+
+                using (var client = new HttpClient())
+                {
+                    foreach (var phone in phones.Distinct())
+                    {
+                        var payload = new
+                        {
+                            ApiKey = "C14F494A458D3D47186D79A3F29D2F",
+                            SecretKey = "160EF0FF1422CFEDD1482C5401D4B7",
+                            Phone = phone,
+                            Channels = new[] { "zalo", "sms" },
+                            Data = new object[]
+                            {
+                                new
+                                {
+                                    TempID = "205644",
+                                    Params = new[] { message },
+                                    OAID = "2167941390785821175",
+                                    campaignid = "FireSmokeAlert",
+                                    CallbackUrl = "https://esms.vn/webhook/",
+                                    RequestId = Guid.NewGuid().ToString(),
+                                    Sandbox = "0",
+                                    SendingMode = "1"
+                                },
+                                new
+                                {
+                                    Content = message,
+                                    IsUnicode = "0",
+                                    SmsType = "2",
+                                    Brandname = "Baotrixemay",
+                                    CallbackUrl = "https://esms.vn/webhook/",
+                                    RequestId = Guid.NewGuid().ToString(),
+                                    Sandbox = "0"
+                                }
+                            }
+                        };
+
+                        string jsonPayload = JsonConvert.SerializeObject(payload);
+                        using var content = new StringContent(jsonPayload, Encoding.UTF8, "application/json");
+
+                        try
+                        {
+                            var response = await client.PostAsync(url, content);
+                            string result = await response.Content.ReadAsStringAsync();
+                            sbResult.AppendLine($"Phone {phone}: {(int)response.StatusCode} - {result}");
+                        }
+                        catch (Exception ex)
+                        {
+                            sbResult.AppendLine($"Phone {phone}: ERROR - {ex.Message}");
+                        }
+                    }
+                }
+
+                string resultText = sbResult.ToString().Trim();
+                if (resultText.Length == 0)
+                {
+                    resultText = "Không có kết quả trả về.";
+                }
+
+                MessageBox.Show(resultText, "Kết quả gửi Zalo");
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show("Lỗi khi gửi Zalo: " + ex.Message, "Lỗi");
             }
         }
         #endregion

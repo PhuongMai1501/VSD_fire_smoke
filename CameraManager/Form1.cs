@@ -20,6 +20,7 @@ using MySql.Data.MySqlClient;
 using System.Threading;
 using System.IO;
 using System.Management;
+using DKVN;
 
 namespace CameraManager
 {
@@ -70,6 +71,7 @@ namespace CameraManager
         private readonly List<List<Detection>> _cameraDetections = new List<List<Detection>>();
         private readonly System.Windows.Forms.Timer _detectionTimer = new System.Windows.Forms.Timer();
         private readonly System.Windows.Forms.Timer _detectionCleanupTimer = new System.Windows.Forms.Timer();
+        private readonly System.Windows.Forms.Timer _alertBlinkTimer = new System.Windows.Forms.Timer();
 
         // Reconnect monitoring (per-camera via DisplayTimer)
         private readonly Dictionary<int, DateTime> _lastFrameAt = new Dictionary<int, DateTime>();
@@ -107,6 +109,14 @@ namespace CameraManager
         private int DETECT_INPUT_SIZE => Math.Max(1, ClassSystemConfig.Ins?.m_ClsCommon?.DetectionInputSize ?? 1280);
         private const long JPEG_QUALITY = 75L; // JPEG quality for request payload
 
+        // Per-camera alert blinking state
+        private const int ALERT_BLINK_INTERVAL_MS = 400;
+        private readonly HashSet<int> _alertBlinkCameras = new HashSet<int>();
+        private readonly Dictionary<int, bool> _alertBlinkPhase = new Dictionary<int, bool>();
+        private readonly Dictionary<int, FormConfirmVision> _alertDialogs = new Dictionary<int, FormConfirmVision>();
+        private readonly HashSet<int> _acknowledgedAlerts = new HashSet<int>();
+        private readonly object _alertLock = new object();
+
         // MySQL Connection
         MySqlConnection connection = new MySqlConnection(ClassSystemConfig.Ins.m_ClsCommon.connectionString);
 
@@ -142,6 +152,7 @@ namespace CameraManager
 
             // Initialize detection components
             InitializeDetectionSystem();
+            InitializeAlertSystem();
         }
 
         #region Form Event Handlers
@@ -864,6 +875,18 @@ namespace CameraManager
                         bool hasSmoke = labels.Any(l => l.Equals("smoke", StringComparison.OrdinalIgnoreCase) || l.Contains("smoke", StringComparison.OrdinalIgnoreCase));
                         string eventText = hasFire ? "FIRE" : (hasSmoke ? "SMOKE" : "FIRE");
 
+                        if ((hasFire || hasSmoke) && !IsDisposed && IsHandleCreated)
+                        {
+                            try
+                            {
+                                BeginInvoke(new Action(() => ActivateCameraAlert(cameraIndex, eventText)));
+                            }
+                            catch (Exception exAlert)
+                            {
+                                FileLogger.LogException(exAlert, "ProcessDetectionAsync -> ActivateCameraAlert");
+                            }
+                        }
+
                         _ = SendAlarmToActiveRecipientsAsync(eventText);
                     }
                     catch (Exception exAlarm)
@@ -872,6 +895,7 @@ namespace CameraManager
                     }
                 }
                 TriggerPaintEvent(cameraIndex, filtered.Count);
+                UpdateAlertAcknowledgementState(cameraIndex, filtered.Count);
             }
             catch (Exception ex)
             {
@@ -888,25 +912,46 @@ namespace CameraManager
             }
         }
 
-        // Gửi cảnh báo theo cấu hình (chỉ Telegram hiện tại) tới các ChatID đang IsActive=1
+        // Gửi cảnh báo theo cấu hình tới các ứng dụng đã bật
         private async Task SendAlarmToActiveRecipientsAsync(string message)
         {
             try
             {
                 if (string.IsNullOrWhiteSpace(message)) return;
-                // ByPass: nếu bật (1) thì bỏ qua không gửi
                 if (ClassSystemConfig.Ins?.m_ClsCommon?.b_ByPassAlarm == 1) return;
 
-                // 0: Telegram (theo form config)
-                if (ClassSystemConfig.Ins?.m_ClsCommon?.m_iFormatSendMessage != 0) return;
+                int mode = ClassSystemConfig.Ins?.m_ClsCommon?.m_iFormatSendMessage ?? 0;
 
+                switch (mode)
+                {
+                    case 0:
+                        await SendTelegramAlarmAsync(message);
+                        break;
+                    case 3:
+                        await SendZaloAlarmAsync(message);
+                        break;
+                    default:
+                        FileLogger.Log($"SendAlarmToActiveRecipientsAsync: No handler for mode {mode}");
+                        break;
+                }
+            }
+            catch (Exception ex)
+            {
+                FileLogger.LogException(ex, "SendAlarmToActiveRecipientsAsync");
+            }
+        }
+
+        private async Task SendTelegramAlarmAsync(string message)
+        {
+            try
+            {
                 string botToken = "7918989769:AAEAH2IAU91rJ3pBGGGLhuE2SDm03Q4-TH4";
                 var recipients = new List<(string Name, string SDT, string ChatID)>();
 
                 string connStr = ClassSystemConfig.Ins?.m_ClsCommon?.connectionString;
                 if (string.IsNullOrWhiteSpace(connStr))
                 {
-                    FileLogger.Log("SendAlarmToActiveRecipientsAsync: Missing DB connection string");
+                    FileLogger.Log("SendTelegramAlarmAsync: Missing DB connection string");
                     return;
                 }
 
@@ -936,7 +981,12 @@ namespace CameraManager
                     }
                 }
 
-                if (recipients.Count == 0) return;
+                if (recipients.Count == 0)
+                {
+                    FileLogger.Log("SendTelegramAlarmAsync: No ChatID found in alarm_mes");
+                    return;
+                }
+
                 recipients = recipients
                     .GroupBy(r => (r.ChatID, r.Name, r.SDT))
                     .Select(g => g.First())
@@ -963,20 +1013,125 @@ namespace CameraManager
                             ClassSystemConfig.Ins.m_ClsFunc.SaveLog(ClassFunction.SAVING_LOG_TYPE.DATA,
                                 $"TELEGRAM SEND | Name={r.Name} | ChatID={r.ChatID} | SDT={r.SDT} | Status={(ok ? "SUCCESS" : "FAIL (HTTP)")}",
                                 ClassSystemConfig.Ins.m_ClsCommon.IsSaveLog_Local, true);
+                            FileLogger.Log($"Telegram sent to ChatID={r.ChatID} => {(ok ? "OK" : "HTTP_FAIL")}.");
                         }
                         catch (Exception exSend)
                         {
                             ClassSystemConfig.Ins.m_ClsFunc.SaveLog(ClassFunction.SAVING_LOG_TYPE.DATA,
                                 $"TELEGRAM SEND | Name={r.Name} | ChatID={r.ChatID} | SDT={r.SDT} | Status=FAIL (EXCEPTION: {exSend.Message})",
                                 ClassSystemConfig.Ins.m_ClsCommon.IsSaveLog_Local, true);
-                            FileLogger.LogException(exSend, $"SendAlarmToActiveRecipientsAsync -> ChatID={r.ChatID}");
+                            FileLogger.LogException(exSend, $"SendTelegramAlarmAsync -> ChatID={r.ChatID}");
                         }
                     }
                 }
             }
             catch (Exception ex)
             {
-                FileLogger.LogException(ex, "SendAlarmToActiveRecipientsAsync");
+                FileLogger.LogException(ex, "SendTelegramAlarmAsync");
+            }
+        }
+
+        private async Task SendZaloAlarmAsync(string message)
+        {
+            try
+            {
+                string connStr = ClassSystemConfig.Ins?.m_ClsCommon?.connectionString;
+                if (string.IsNullOrWhiteSpace(connStr))
+                {
+                    FileLogger.Log("SendZaloAlarmAsync: Missing DB connection string");
+                    return;
+                }
+
+                var phones = new List<(string Name, string Phone)>();
+                using (var conn = new MySql.Data.MySqlClient.MySqlConnection(connStr))
+                {
+                    await conn.OpenAsync();
+                    string sql = "SELECT Name, SDT FROM alarm_mes WHERE IsActive = 1 AND SDT IS NOT NULL AND TRIM(SDT) <> ''";
+                    using (var cmd = new MySql.Data.MySqlClient.MySqlCommand(sql, conn))
+                    using (var reader = await cmd.ExecuteReaderAsync())
+                    {
+                        while (await reader.ReadAsync())
+                        {
+                            var name = reader["Name"]?.ToString()?.Trim() ?? string.Empty;
+                            var phone = reader["SDT"]?.ToString()?.Trim();
+                            if (!string.IsNullOrWhiteSpace(phone))
+                            {
+                                phones.Add((name, phone));
+                            }
+                        }
+                    }
+                }
+
+                if (phones.Count == 0)
+                {
+                    FileLogger.Log("SendZaloAlarmAsync: No phone numbers found in alarm_mes");
+                    return;
+                }
+
+                const string url = "https://rest.esms.vn/MainService.svc/json/MultiChannelMessage/";
+
+                using (var client = new HttpClient())
+                {
+                    foreach (var entry in phones.GroupBy(p => p.Phone).Select(g => g.First()))
+                    {
+                        var payload = new
+                        {
+                            ApiKey = "C14F494A458D3D47186D79A3F29D2F",
+                            SecretKey = "160EF0FF1422CFEDD1482C5401D4B7",
+                            Phone = entry.Phone,
+                            Channels = new[] { "zalo", "sms" },
+                            Data = new object[]
+                            {
+                                new
+                                {
+                                    TempID = "205644",
+                                    Params = new[] { message },
+                                    OAID = "4097311281936189049",
+                                    campaignid = "FireSmokeAlert",
+                                    CallbackUrl = "https://esms.vn/webhook/",
+                                    RequestId = Guid.NewGuid().ToString(),
+                                    Sandbox = "0",
+                                    SendingMode = "1"
+                                },
+                                new
+                                {
+                                    Content = message,
+                                    IsUnicode = "0",
+                                    SmsType = "2",
+                                    Brandname = "Baotrixemay",
+                                    CallbackUrl = "https://esms.vn/webhook/",
+                                    RequestId = Guid.NewGuid().ToString(),
+                                    Sandbox = "0"
+                                }
+                            }
+                        };
+
+                        string jsonPayload = JsonConvert.SerializeObject(payload);
+                        using var content = new StringContent(jsonPayload, Encoding.UTF8, "application/json");
+
+                        try
+                        {
+                            var response = await client.PostAsync(url, content);
+                            string result = await response.Content.ReadAsStringAsync();
+
+                            ClassSystemConfig.Ins.m_ClsFunc.SaveLog(ClassFunction.SAVING_LOG_TYPE.DATA,
+                                $"ZALO SEND | Phone={entry.Phone} | Status={(response.IsSuccessStatusCode ? "SUCCESS" : $"FAIL ({response.StatusCode})")}",
+                                ClassSystemConfig.Ins.m_ClsCommon.IsSaveLog_Local, true);
+                            FileLogger.Log($"Zalo sent to {entry.Phone} => {(response.IsSuccessStatusCode ? "OK" : response.StatusCode.ToString())} | Result={result}");
+                        }
+                        catch (Exception exSend)
+                        {
+                            ClassSystemConfig.Ins.m_ClsFunc.SaveLog(ClassFunction.SAVING_LOG_TYPE.DATA,
+                                $"ZALO SEND | Phone={entry.Phone} | Status=FAIL (EXCEPTION: {exSend.Message})",
+                                ClassSystemConfig.Ins.m_ClsCommon.IsSaveLog_Local, true);
+                            FileLogger.LogException(exSend, $"SendZaloAlarmAsync -> Phone={entry.Phone}");
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                FileLogger.LogException(ex, "SendZaloAlarmAsync");
             }
         }
 
@@ -1122,6 +1277,246 @@ namespace CameraManager
             {
                 FileLogger.LogException(ex, "DrawDetectionBoxes");
             }
+        }
+
+        private void DrawAlertBlinkOverlay(Graphics graphics, Rectangle bounds)
+        {
+            try
+            {
+                if (graphics == null) return;
+
+                using (var brush = new SolidBrush(Color.FromArgb(120, Color.Red)))
+                {
+                    graphics.FillRectangle(brush, bounds);
+                }
+
+                using (var pen = new Pen(Color.Red, 4))
+                {
+                    graphics.DrawRectangle(pen, new Rectangle(bounds.X + 2, bounds.Y + 2, Math.Max(1, bounds.Width - 4), Math.Max(1, bounds.Height - 4)));
+                }
+            }
+            catch (Exception ex)
+            {
+                FileLogger.LogException(ex, "DrawAlertBlinkOverlay");
+            }
+        }
+
+        private void InitializeAlertSystem()
+        {
+            try
+            {
+                _alertBlinkTimer.Interval = ALERT_BLINK_INTERVAL_MS;
+                _alertBlinkTimer.Tick += AlertBlinkTimer_Tick;
+                _alertBlinkTimer.Start();
+            }
+            catch (Exception ex)
+            {
+                FileLogger.LogException(ex, "InitializeAlertSystem");
+            }
+        }
+
+        private void AlertBlinkTimer_Tick(object sender, EventArgs e)
+        {
+            List<int> targets = null;
+            lock (_alertLock)
+            {
+                if (_alertBlinkCameras.Count == 0) return;
+                targets = _alertBlinkCameras.ToList();
+                foreach (var camera in targets)
+                {
+                    bool current = false;
+                    _alertBlinkPhase.TryGetValue(camera, out current);
+                    _alertBlinkPhase[camera] = !current;
+                }
+            }
+
+            foreach (var cameraIndex in targets)
+            {
+                TriggerPaintEvent(cameraIndex, GetDetectionCount(cameraIndex));
+            }
+        }
+
+        private void ActivateCameraAlert(int cameraIndex, string eventText)
+        {
+            if (cameraIndex < 0) return;
+
+            lock (_alertLock)
+            {
+                if (_acknowledgedAlerts.Contains(cameraIndex))
+                {
+                    return;
+                }
+
+                _alertBlinkCameras.Add(cameraIndex);
+                _alertBlinkPhase[cameraIndex] = true;
+            }
+
+            TriggerPaintEvent(cameraIndex, GetDetectionCount(cameraIndex));
+
+            var dialog = GetOrCreateAlertDialog(cameraIndex);
+            if (dialog == null) return;
+
+            string message = BuildAlertMessage(eventText, cameraIndex);
+            dialog.AlarmText = message;
+            dialog.InitializeUI(cameraIndex, cameraIndex);
+            dialog.SetAlarm(message, cameraIndex);
+            dialog.Text = $"Canh bao Camera {cameraIndex + 1}";
+
+            if (!dialog.Visible)
+            {
+                try { dialog.StartPosition = FormStartPosition.CenterParent; } catch { }
+                dialog.Show(this);
+            }
+            else
+            {
+                dialog.BringToFront();
+            }
+
+            try { dialog.Focus(); } catch { }
+        }
+
+        private void HandleAlertConfirmed(int cameraIndex)
+        {
+            lock (_alertLock)
+            {
+                _acknowledgedAlerts.Add(cameraIndex);
+            }
+
+            DeactivateCameraAlert(cameraIndex);
+        }
+
+        private void HandleAlertCanceled(int cameraIndex)
+        {
+            var dialog = GetAlertDialog(cameraIndex);
+            if (dialog == null) return;
+
+            if (!dialog.Visible)
+            {
+                dialog.Show(this);
+            }
+
+            dialog.BringToFront();
+        }
+
+        private void DeactivateCameraAlert(int cameraIndex)
+        {
+            lock (_alertLock)
+            {
+                _alertBlinkCameras.Remove(cameraIndex);
+                _alertBlinkPhase.Remove(cameraIndex);
+            }
+
+            var dialog = GetAlertDialog(cameraIndex);
+            if (dialog != null)
+            {
+                try { dialog.Hide(); } catch { }
+            }
+
+            TriggerPaintEvent(cameraIndex, GetDetectionCount(cameraIndex));
+        }
+
+        private bool IsAlertBlinkVisible(int cameraIndex)
+        {
+            lock (_alertLock)
+            {
+                if (!_alertBlinkCameras.Contains(cameraIndex)) return false;
+                if (!_alertBlinkPhase.TryGetValue(cameraIndex, out bool state)) return true;
+                return state;
+            }
+        }
+
+        private FormConfirmVision GetOrCreateAlertDialog(int cameraIndex)
+        {
+            FormConfirmVision dialog = null;
+            lock (_alertLock)
+            {
+                if (_alertDialogs.TryGetValue(cameraIndex, out dialog))
+                {
+                    if (dialog != null && !dialog.IsDisposed)
+                    {
+                        return dialog;
+                    }
+                }
+
+                dialog = new FormConfirmVision();
+                dialog.InitializeUI(cameraIndex, cameraIndex);
+                dialog.OnConfirm = idx =>
+                {
+                    try
+                    {
+                        if (!IsDisposed && IsHandleCreated)
+                        {
+                            BeginInvoke(new Action(() => HandleAlertConfirmed(idx)));
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        FileLogger.LogException(ex, "HandleAlertConfirmed invoke");
+                    }
+                };
+                dialog.OnCancel = idx =>
+                {
+                    try
+                    {
+                        if (!IsDisposed && IsHandleCreated)
+                        {
+                            BeginInvoke(new Action(() => HandleAlertCanceled(idx)));
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        FileLogger.LogException(ex, "HandleAlertCanceled invoke");
+                    }
+                };
+
+                _alertDialogs[cameraIndex] = dialog;
+            }
+
+            return dialog;
+        }
+
+        private FormConfirmVision GetAlertDialog(int cameraIndex)
+        {
+            lock (_alertLock)
+            {
+                if (_alertDialogs.TryGetValue(cameraIndex, out var dialog) && dialog != null && !dialog.IsDisposed)
+                {
+                    return dialog;
+                }
+            }
+
+            return null;
+        }
+
+        private int GetDetectionCount(int cameraIndex)
+        {
+            lock (_cameraDetections)
+            {
+                if (cameraIndex >= 0 && cameraIndex < _cameraDetections.Count)
+                {
+                    return _cameraDetections[cameraIndex].Count;
+                }
+            }
+
+            return 0;
+        }
+
+        private void UpdateAlertAcknowledgementState(int cameraIndex, int detectionCount)
+        {
+            if (detectionCount == 0)
+            {
+                lock (_alertLock)
+                {
+                    _acknowledgedAlerts.Remove(cameraIndex);
+                }
+            }
+        }
+
+        private static string BuildAlertMessage(string eventText, int cameraIndex)
+        {
+            string normalized = string.IsNullOrWhiteSpace(eventText) ? "" : eventText.Trim().ToUpperInvariant();
+            string description = normalized == "SMOKE" ? "khoi" : "chay";
+            return $"Canh bao {description} tai Camera {cameraIndex + 1}. Vui long xac nhan.";
         }
 
         // Save annotated image to folder structure yyyy/MM/dd/image_#.jpg
@@ -1580,6 +1975,11 @@ namespace CameraManager
                 if (detections?.Count > 0)
                 {
                     DrawDetectionBoxes(e.Graphics, detections, pictureBox.Width, pictureBox.Height);
+                }
+
+                if (IsAlertBlinkVisible(cameraIndex))
+                {
+                    DrawAlertBlinkOverlay(e.Graphics, pictureBox.ClientRectangle);
                 }
             }
             catch (Exception ex)
