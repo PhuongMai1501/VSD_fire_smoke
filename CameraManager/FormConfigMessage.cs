@@ -19,9 +19,7 @@ namespace CameraManager
     public partial class FormConfigMessage : Form
     {
         private DiscordSocketClient _discordClient;
-        private bool _discordReady = false;
-        private string _discordBotToken = "MTM5NzQyNjg5NTQ1MjI0NjAxNg.GB8PVN.Q7exGNICXiQlx2-wQxW0-qKr0y7lzoKCsYYtz4";
-        private ulong _discordChannelId = 653602857060401207; // Replace with your channel ID
+        private MessageSecrets Secrets => MessageSecretProvider.GetSecrets();
 
         public FormConfigMessage()
         {
@@ -231,7 +229,14 @@ namespace CameraManager
             {
                 if (string.IsNullOrWhiteSpace(message)) return;
 
-                string botToken = "7918989769:AAEAH2IAU91rJ3pBGGGLhuE2SDm03Q4-TH4";
+                var secrets = Secrets;
+                string botToken = secrets.TelegramBotToken;
+                if (string.IsNullOrWhiteSpace(botToken))
+                {
+                    MessageBox.Show("Không tìm thấy Telegram bot token trong file MessageSecrets.ini.");
+                    FileLogger.Log("SendTelegramMessageAsync: Missing Telegram bot token");
+                    return;
+                }
                 // Lấy danh sách người nhận: Name, SDT, ChatID (có thể nhiều ID trong 1 ô)
                 var recipients = new List<(string Name, string SDT, string ChatID)>();
                 string connStr = ClassSystemConfig.Ins?.m_ClsCommon?.connectionString;
@@ -330,12 +335,27 @@ namespace CameraManager
                 return;
             }
 
+            var secrets = Secrets;
+            if (string.IsNullOrWhiteSpace(secrets.DiscordBotToken))
+            {
+                MessageBox.Show("Không tìm thấy Discord bot token trong file MessageSecrets.ini.");
+                FileLogger.Log("SendDiscordMessageAsync: Missing Discord bot token");
+                return;
+            }
+
+            if (secrets.DiscordChannelId == 0)
+            {
+                MessageBox.Show("Không tìm thấy Discord channel ID hợp lệ trong file MessageSecrets.ini.");
+                FileLogger.Log("SendDiscordMessageAsync: Missing Discord channel id");
+                return;
+            }
+
             // Ensure the Discord client is initialized and connected
             if (_discordClient == null)
             {
                 _discordClient = new DiscordSocketClient();
                 _discordClient.Log += (msg) => { Console.WriteLine(msg); return Task.CompletedTask; };
-                await _discordClient.LoginAsync(TokenType.Bot, _discordBotToken);
+                await _discordClient.LoginAsync(TokenType.Bot, secrets.DiscordBotToken);
                 await _discordClient.StartAsync();
 
                 // Wait for the client to be ready
@@ -348,7 +368,7 @@ namespace CameraManager
                 await tcs.Task;
             }
 
-            var channel = _discordClient.GetChannel(_discordChannelId) as IMessageChannel;
+            var channel = _discordClient.GetChannel(secrets.DiscordChannelId) as IMessageChannel;
             if (channel != null)
             {
                 await channel.SendMessageAsync(message);
@@ -402,6 +422,28 @@ namespace CameraManager
                     return;
                 }
 
+                var secrets = Secrets;
+                if (string.IsNullOrWhiteSpace(secrets.EsmsApiKey) || string.IsNullOrWhiteSpace(secrets.EsmsSecretKey))
+                {
+                    MessageBox.Show("Chưa cấu hình ApiKey hoặc SecretKey cho Zalo trong file MessageSecrets.ini.");
+                    FileLogger.Log("SendZaloMessageAsync: Missing eSMS ApiKey/SecretKey");
+                    return;
+                }
+
+                if (string.IsNullOrWhiteSpace(secrets.EsmsOaid) || string.IsNullOrWhiteSpace(secrets.EsmsTemplateId) || string.IsNullOrWhiteSpace(secrets.EsmsBrandName))
+                {
+                    MessageBox.Show("Chưa cấu hình đủ thông tin OAID, TemplateId hoặc Brandname cho Zalo trong file MessageSecrets.ini.");
+                    FileLogger.Log("SendZaloMessageAsync: Missing eSMS OAID/TemplateId/Brandname");
+                    return;
+                }
+
+                string callbackUrl = string.IsNullOrWhiteSpace(secrets.EsmsCallbackUrl)
+                    ? "https://esms.vn/webhook/"
+                    : secrets.EsmsCallbackUrl;
+                string campaignId = string.IsNullOrWhiteSpace(secrets.EsmsCampaignId)
+                    ? "FireSmokeAlert"
+                    : secrets.EsmsCampaignId;
+
                 const string url = "https://rest.esms.vn/MainService.svc/json/MultiChannelMessage/";
                 var sbResult = new StringBuilder();
 
@@ -411,19 +453,19 @@ namespace CameraManager
                     {
                         var payload = new
                         {
-                            ApiKey = "C14F494A458D3D47186D79A3F29D2F",
-                            SecretKey = "160EF0FF1422CFEDD1482C5401D4B7",
+                            ApiKey = secrets.EsmsApiKey,
+                            SecretKey = secrets.EsmsSecretKey,
                             Phone = phone,
                             Channels = new[] { "zalo", "sms" },
                             Data = new object[]
                             {
                                 new
                                 {
-                                    TempID = "205644",
+                                    TempID = secrets.EsmsTemplateId,
                                     Params = new[] { message },
-                                    OAID = "2167941390785821175",
-                                    campaignid = "FireSmokeAlert",
-                                    CallbackUrl = "https://esms.vn/webhook/",
+                                    OAID = secrets.EsmsOaid,
+                                    campaignid = campaignId,
+                                    CallbackUrl = callbackUrl,
                                     RequestId = Guid.NewGuid().ToString(),
                                     Sandbox = "0",
                                     SendingMode = "1"
@@ -433,8 +475,8 @@ namespace CameraManager
                                     Content = message,
                                     IsUnicode = "0",
                                     SmsType = "2",
-                                    Brandname = "Baotrixemay",
-                                    CallbackUrl = "https://esms.vn/webhook/",
+                                    Brandname = secrets.EsmsBrandName,
+                                    CallbackUrl = callbackUrl,
                                     RequestId = Guid.NewGuid().ToString(),
                                     Sandbox = "0"
                                 }

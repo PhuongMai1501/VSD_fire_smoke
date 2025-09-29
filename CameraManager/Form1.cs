@@ -945,7 +945,14 @@ namespace CameraManager
         {
             try
             {
-                string botToken = "7918989769:AAEAH2IAU91rJ3pBGGGLhuE2SDm03Q4-TH4";
+                var secrets = MessageSecretProvider.GetSecrets();
+                if (string.IsNullOrWhiteSpace(secrets.TelegramBotToken))
+                {
+                    FileLogger.Log("SendTelegramAlarmAsync: Missing Telegram bot token");
+                    return;
+                }
+
+                string botToken = secrets.TelegramBotToken;
                 var recipients = new List<(string Name, string SDT, string ChatID)>();
 
                 string connStr = ClassSystemConfig.Ins?.m_ClsCommon?.connectionString;
@@ -1068,6 +1075,26 @@ namespace CameraManager
                     return;
                 }
 
+                var secrets = MessageSecretProvider.GetSecrets();
+                if (string.IsNullOrWhiteSpace(secrets.EsmsApiKey) || string.IsNullOrWhiteSpace(secrets.EsmsSecretKey))
+                {
+                    FileLogger.Log("SendZaloAlarmAsync: Missing eSMS ApiKey/SecretKey");
+                    return;
+                }
+
+                if (string.IsNullOrWhiteSpace(secrets.EsmsOaid) || string.IsNullOrWhiteSpace(secrets.EsmsTemplateId) || string.IsNullOrWhiteSpace(secrets.EsmsBrandName))
+                {
+                    FileLogger.Log("SendZaloAlarmAsync: Missing eSMS OAID/TemplateId/Brandname");
+                    return;
+                }
+
+                string callbackUrl = string.IsNullOrWhiteSpace(secrets.EsmsCallbackUrl)
+                    ? "https://esms.vn/webhook/"
+                    : secrets.EsmsCallbackUrl;
+                string campaignId = string.IsNullOrWhiteSpace(secrets.EsmsCampaignId)
+                    ? "FireSmokeAlert"
+                    : secrets.EsmsCampaignId;
+
                 const string url = "https://rest.esms.vn/MainService.svc/json/MultiChannelMessage/";
 
                 using (var client = new HttpClient())
@@ -1076,19 +1103,19 @@ namespace CameraManager
                     {
                         var payload = new
                         {
-                            ApiKey = "C14F494A458D3D47186D79A3F29D2F",
-                            SecretKey = "160EF0FF1422CFEDD1482C5401D4B7",
+                            ApiKey = secrets.EsmsApiKey,
+                            SecretKey = secrets.EsmsSecretKey,
                             Phone = entry.Phone,
                             Channels = new[] { "zalo", "sms" },
                             Data = new object[]
                             {
                                 new
                                 {
-                                    TempID = "205644",
+                                    TempID = secrets.EsmsTemplateId,
                                     Params = new[] { message },
-                                    OAID = "4097311281936189049",
-                                    campaignid = "FireSmokeAlert",
-                                    CallbackUrl = "https://esms.vn/webhook/",
+                                    OAID = secrets.EsmsOaid,
+                                    campaignid = campaignId,
+                                    CallbackUrl = callbackUrl,
                                     RequestId = Guid.NewGuid().ToString(),
                                     Sandbox = "0",
                                     SendingMode = "1"
@@ -1098,8 +1125,8 @@ namespace CameraManager
                                     Content = message,
                                     IsUnicode = "0",
                                     SmsType = "2",
-                                    Brandname = "Baotrixemay",
-                                    CallbackUrl = "https://esms.vn/webhook/",
+                                    Brandname = secrets.EsmsBrandName,
+                                    CallbackUrl = callbackUrl,
                                     RequestId = Guid.NewGuid().ToString(),
                                     Sandbox = "0"
                                 }
