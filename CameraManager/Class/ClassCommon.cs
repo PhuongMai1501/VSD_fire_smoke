@@ -19,7 +19,7 @@ namespace CameraManager
         #region Common variables
         public const int MaxUserControl = 1;
         public const int MaxDevice = 1;
-        public static string ProgramName = "TAPE INSPECTION";
+        public static string ProgramName = "Phong 1";
         public const string ProgramVersion = "VER.3.0.1-UpdateConfirmVision&FixDisconnect";
         public const string ProgramReleasedDate = "08/07/2024";
         public static string StrLoadingFormName = "LOADING...";

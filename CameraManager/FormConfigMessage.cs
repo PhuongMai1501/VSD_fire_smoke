@@ -397,26 +397,34 @@ namespace CameraManager
                     return;
                 }
 
-                var phones = new List<string>();
+                var recipients = new List<(int Id, string Name, string Phone)>();
                 using (var conn = new MySqlConnection(connStr))
                 {
                     await conn.OpenAsync();
-                    string sql = "SELECT SDT FROM alarm_mes WHERE IsActive = 1 AND SDT IS NOT NULL AND TRIM(SDT) <> ''";
+                    string sql = "SELECT ID, Name, SDT FROM alarm_mes WHERE IsActive = 1 AND SDT IS NOT NULL AND TRIM(SDT) <> ''";
                     using (var cmd = new MySqlCommand(sql, conn))
                     using (var reader = await cmd.ExecuteReaderAsync())
                     {
                         while (await reader.ReadAsync())
                         {
+                            int id = 0;
+                            var idValue = reader["ID"];
+                            if (idValue != null)
+                            {
+                                int.TryParse(idValue.ToString(), out id);
+                            }
+
+                            var name = reader["Name"]?.ToString()?.Trim() ?? string.Empty;
                             var phone = reader["SDT"]?.ToString()?.Trim();
                             if (!string.IsNullOrWhiteSpace(phone))
                             {
-                                phones.Add(phone);
+                                recipients.Add((id, name, phone));
                             }
                         }
                     }
                 }
 
-                if (phones.Count == 0)
+                if (recipients.Count == 0)
                 {
                     MessageBox.Show("Không có số điện thoại kích hoạt để gửi Zalo!");
                     return;
@@ -447,22 +455,47 @@ namespace CameraManager
                 const string url = "https://rest.esms.vn/MainService.svc/json/MultiChannelMessage/";
                 var sbResult = new StringBuilder();
 
+                string area = "Phong 1";
+                if (string.IsNullOrWhiteSpace(area))
+                {
+                    area = ClassCommon.ProgramName;
+                }
+
+                string severity = string.IsNullOrWhiteSpace(message) ? "Không xác định" : message;
+                string detectionTime = DateTime.Now.ToString("dd/MM/yyyy HH:mm:ss");
+
                 using (var client = new HttpClient())
                 {
-                    foreach (var phone in phones.Distinct())
+                    foreach (var recipient in recipients
+                        .GroupBy(r => r.Phone)
+                        .Select(g => g.First()))
                     {
+                        string deptName = string.IsNullOrWhiteSpace(recipient.Name)
+                            ? "Không xác định"
+                            : recipient.Name;
+                        string deptId = recipient.Id > 0 ? recipient.Id.ToString() : "Không xác định";
+
+                        var zaloParams = new[]
+                        {
+                            area,
+                            detectionTime,
+                            severity,
+                            deptName,
+                            deptId
+                        };
+
                         var payload = new
                         {
                             ApiKey = secrets.EsmsApiKey,
                             SecretKey = secrets.EsmsSecretKey,
-                            Phone = phone,
+                            Phone = recipient.Phone,
                             Channels = new[] { "zalo", "sms" },
                             Data = new object[]
                             {
                                 new
                                 {
                                     TempID = secrets.EsmsTemplateId,
-                                    Params = new[] { message },
+                                    Params = zaloParams,
                                     OAID = secrets.EsmsOaid,
                                     campaignid = campaignId,
                                     CallbackUrl = callbackUrl,
@@ -490,11 +523,11 @@ namespace CameraManager
                         {
                             var response = await client.PostAsync(url, content);
                             string result = await response.Content.ReadAsStringAsync();
-                            sbResult.AppendLine($"Phone {phone}: {(int)response.StatusCode} - {result}");
+                            sbResult.AppendLine($"Phone {recipient.Phone}: {(int)response.StatusCode} - {result}");
                         }
                         catch (Exception ex)
                         {
-                            sbResult.AppendLine($"Phone {phone}: ERROR - {ex.Message}");
+                            sbResult.AppendLine($"Phone {recipient.Phone}: ERROR - {ex.Message}");
                         }
                     }
                 }
